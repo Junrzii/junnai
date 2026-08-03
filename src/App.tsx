@@ -52,9 +52,9 @@ type GalleryItem = {
 type GalleryRecord = Omit<GalleryItem, "imageUrl"> & { blob: Blob };
 
 const sizes: Record<PresetSizeKey, { width: number; height: number; label: string; hint: string }> = {
-  smallPortrait: { width: 512, height: 768, label: "小图竖版", hint: "512 × 768" },
-  smallSquare: { width: 640, height: 640, label: "小图方形", hint: "640 × 640" },
-  smallLandscape: { width: 768, height: 512, label: "小图横版", hint: "768 × 512" },
+  smallPortrait: { width: 512, height: 768, label: "不限额小竖图", hint: "512 × 768 · Opus" },
+  smallSquare: { width: 640, height: 640, label: "不限额小方图", hint: "640 × 640 · Opus" },
+  smallLandscape: { width: 768, height: 512, label: "不限额小横图", hint: "768 × 512 · Opus" },
   portrait: { width: 832, height: 1216, label: "标准竖图", hint: "832 × 1216" },
   square: { width: 1024, height: 1024, label: "正方形", hint: "1024 × 1024" },
   landscape: { width: 1216, height: 832, label: "标准横图", hint: "1216 × 832" },
@@ -72,6 +72,35 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 
 function normalizeDimension(value: number) {
   return Math.round(clampNumber(value, 512, 256, 2048) / 64) * 64;
+}
+
+function prepareBrandLogo(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const source = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      if (!context) {
+        URL.revokeObjectURL(source);
+        reject(new Error("当前浏览器无法处理这张图片。"));
+        return;
+      }
+      const side = Math.min(image.naturalWidth, image.naturalHeight);
+      const left = (image.naturalWidth - side) / 2;
+      const top = (image.naturalHeight - side) / 2;
+      canvas.width = 256;
+      canvas.height = 256;
+      context.drawImage(image, left, top, side, side, 0, 0, 256, 256);
+      URL.revokeObjectURL(source);
+      resolve(canvas.toDataURL("image/webp", 0.9));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(source);
+      reject(new Error("图片读取失败，请换一张 PNG、JPG 或 WebP。"));
+    };
+    image.src = source;
+  });
 }
 
 function cleanEncoding(value: unknown) {
@@ -288,6 +317,13 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<"create" | "gallery">("create");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [brandName, setBrandName] = useState("JunNAI");
+  const [brandSubtitle, setBrandSubtitle] = useState("简单、直接的手机生图页");
+  const [brandIconText, setBrandIconText] = useState("N");
+  const [brandColor, setBrandColor] = useState("#6f50dd");
+  const [brandLogo, setBrandLogo] = useState("");
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
+  const [appearanceError, setAppearanceError] = useState("");
   const [prompt, setPrompt] = useState("");
   const [artistString, setArtistString] = useState("");
   const [artistEnabled, setArtistEnabled] = useState(true);
@@ -317,10 +353,20 @@ export default function Home() {
   const [galleryError, setGalleryError] = useState("");
   const [selectedImage, setSelectedImage] = useState<GalleryItem | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const brandLogoInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setApiKey(sessionStorage.getItem("nai-vibe-key") ?? "");
+      const savedKey = localStorage.getItem("nai-vibe-key") ?? sessionStorage.getItem("nai-vibe-key") ?? "";
+      setApiKey(savedKey);
+      if (savedKey) localStorage.setItem("nai-vibe-key", savedKey);
+      sessionStorage.removeItem("nai-vibe-key");
+      setNegative(localStorage.getItem("nai-negative-prompt") ?? defaultNegative);
+      setBrandName(localStorage.getItem("nai-brand-name") ?? "JunNAI");
+      setBrandSubtitle(localStorage.getItem("nai-brand-subtitle") ?? "简单、直接的手机生图页");
+      setBrandIconText(localStorage.getItem("nai-brand-icon-text") ?? "N");
+      setBrandColor(localStorage.getItem("nai-brand-color") ?? "#6f50dd");
+      setBrandLogo(localStorage.getItem("nai-brand-logo") ?? "");
       setArtistString(localStorage.getItem("nai-artist-string") ?? "");
       setArtistEnabled(localStorage.getItem("nai-artist-enabled") !== "false");
       try {
@@ -331,7 +377,7 @@ export default function Home() {
       }
       setSelectedArtistPresetId(localStorage.getItem("nai-artist-selected") ?? "");
       const savedCount = Number(localStorage.getItem("nai-generation-count"));
-      if ([1, 2, 3, 4].includes(savedCount)) setGenerationCount(savedCount);
+      if ([1, 2, 3, 4, 5, 6].includes(savedCount)) setGenerationCount(savedCount);
       const savedWidth = Number(localStorage.getItem("nai-custom-width"));
       const savedHeight = Number(localStorage.getItem("nai-custom-height"));
       if (Number.isFinite(savedWidth)) setCustomWidth(normalizeDimension(savedWidth));
@@ -343,8 +389,15 @@ export default function Home() {
 
   useEffect(() => {
     if (!preferencesReady) return;
-    if (apiKey) sessionStorage.setItem("nai-vibe-key", apiKey);
-    else sessionStorage.removeItem("nai-vibe-key");
+    if (apiKey) localStorage.setItem("nai-vibe-key", apiKey);
+    else localStorage.removeItem("nai-vibe-key");
+    localStorage.setItem("nai-negative-prompt", negative);
+    localStorage.setItem("nai-brand-name", brandName);
+    localStorage.setItem("nai-brand-subtitle", brandSubtitle);
+    localStorage.setItem("nai-brand-icon-text", brandIconText);
+    localStorage.setItem("nai-brand-color", brandColor);
+    if (brandLogo) localStorage.setItem("nai-brand-logo", brandLogo);
+    else localStorage.removeItem("nai-brand-logo");
     localStorage.setItem("nai-artist-string", artistString);
     localStorage.setItem("nai-artist-enabled", String(artistEnabled));
     localStorage.setItem("nai-artist-presets", JSON.stringify(artistPresets));
@@ -357,9 +410,15 @@ export default function Home() {
     artistEnabled,
     artistPresets,
     artistString,
+    brandColor,
+    brandIconText,
+    brandLogo,
+    brandName,
+    brandSubtitle,
     customHeight,
     customWidth,
     generationCount,
+    negative,
     preferencesReady,
     selectedArtistPresetId,
   ]);
@@ -378,10 +437,42 @@ export default function Home() {
           hint: `${normalizeDimension(customWidth)} × ${normalizeDimension(customHeight)}`,
         }
       : sizes[sizeKey];
+  const isSmallPreset = sizeKey.startsWith("small");
+  const opusUnlimitedReady = isSmallPreset && generationCount === 1 && steps <= 28;
+  const quantityOptions = isSmallPreset ? [1, 2, 3, 4, 5, 6] : [1, 2, 3, 4];
   const strengthTotal = useMemo(
     () => vibes.reduce((sum, vibe) => sum + vibe.strength, 0),
     [vibes],
   );
+
+  useEffect(() => {
+    if (!isSmallPreset && generationCount > 4) setGenerationCount(4);
+  }, [generationCount, isSmallPreset]);
+
+  async function importBrandLogo(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setAppearanceError("请选择 PNG、JPG 或 WebP 图片。");
+      return;
+    }
+    try {
+      setBrandLogo(await prepareBrandLogo(file));
+      setAppearanceError("");
+    } catch (caught) {
+      setAppearanceError(caught instanceof Error ? caught.message : "图标读取失败。");
+    }
+  }
+
+  function resetBrandDesign() {
+    setBrandName("JunNAI");
+    setBrandSubtitle("简单、直接的手机生图页");
+    setBrandIconText("N");
+    setBrandColor("#6f50dd");
+    setBrandLogo("");
+    setAppearanceError("");
+  }
 
   async function loadGallery() {
     setGalleryLoading(true);
@@ -674,10 +765,12 @@ export default function Home() {
   return (
     <main className={`app-shell ${activeTab === "gallery" ? "gallery-mode" : ""}`}>
       <header className="topbar">
-        <div className="brand-mark" aria-hidden="true">N</div>
+        <button className="brand-mark" type="button" onClick={() => setAppearanceOpen(true)} aria-label="自定义顶部设计" style={{ background: brandColor }}>
+          {brandLogo ? <img src={brandLogo} alt="" /> : brandIconText.trim().slice(0, 2) || "N"}
+        </button>
         <div className="brand-copy">
-          <h1>JunNAI</h1>
-          <p>简单、直接的手机生图页</p>
+          <h1>{brandName.trim() || "JunNAI"}</h1>
+          <p>{brandSubtitle.trim() || "简单、直接的手机生图页"}</p>
         </div>
         <nav className="top-tabs" aria-label="页面切换">
           <button className={activeTab === "create" ? "active" : ""} onClick={() => setActiveTab("create")}>生图</button>
@@ -730,8 +823,8 @@ export default function Home() {
 
           <section className="control-card">
             <label className="field-label" htmlFor="api-key"><span>NAI Key</span><small>pst- 开头</small></label>
-            <div className="key-field"><input id="api-key" type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="粘贴你的 pst- Key" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button></div>
-            <p className="helper">Key 仅保存在这个浏览器会话中，并直接发送给 NovelAI。</p>
+            <div className="key-field"><input id="api-key" type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="粘贴你的 pst- Key" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button><button type="button" className="clear-key" onClick={() => setApiKey("")} disabled={!apiKey}>清除</button></div>
+            <p className="helper">Key 会长期保存在当前设备的这个浏览器中，并直接发送给 NovelAI。请不要在公共设备上保存。</p>
           </section>
 
           <section className="control-card prompt-card">
@@ -793,12 +886,13 @@ export default function Home() {
               <label><span>高度</span><input type="number" min="256" max="2048" step="64" value={customHeight} onChange={(event) => setCustomHeight(Number(event.target.value))} onBlur={() => setCustomHeight(normalizeDimension(customHeight))} /></label>
               <small>会自动取最接近的 64 倍数，范围 256–2048。</small>
             </div>}
-            <div className="quantity-row"><div><strong>生成数量</strong><small>一次生成 1–4 张</small></div><div className="quantity-control" aria-label="生成数量">{[1, 2, 3, 4].map((count) => <button key={count} className={generationCount === count ? "active" : ""} onClick={() => setGenerationCount(count)}>{count}</button>)}</div></div>
+            {isSmallPreset && <div className={`opus-unlimited-note ${opusUnlimitedReady ? "ready" : ""}`}><div><strong>{opusUnlimitedReady ? "已符合 Opus 不耗 Anlas 条件" : "Opus 不限额小图"}</strong><small>需单张生成、Steps 不超过 28；图片 Vibe 首次编码仍可能消耗 Anlas。</small></div>{!opusUnlimitedReady && <button type="button" onClick={() => { setGenerationCount(1); setSteps(Math.min(steps, 28)); }}>应用不限额设置</button>}</div>}
+            <div className="quantity-row"><div><strong>生成数量</strong><small>{isSmallPreset ? "小图一次最多 6 张；批量生成会消耗 Anlas" : "一次生成 1–4 张"}</small></div><div className="quantity-control" aria-label="生成数量">{quantityOptions.map((count) => <button key={count} className={generationCount === count ? "active" : ""} onClick={() => setGenerationCount(count)}>{count}</button>)}</div></div>
           </section>
 
           <section className="control-card advanced-card">
             <button className="advanced-toggle" type="button" onClick={() => setAdvancedOpen((value) => !value)} aria-expanded={advancedOpen}><span><strong>高级设置</strong><small>一般保持默认就可以</small></span><b>{advancedOpen ? "收起" : "展开"}</b></button>
-            {advancedOpen && <div className="advanced-body"><label><span>模型</span><select value={model} onChange={(event) => { setModel(event.target.value); setVibes((current) => current.map((vibe) => vibe.source === "image" ? { ...vibe, encoding: undefined, encodingKey: undefined } : vibe)); }}><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></select></label><label><span>负面提示词</span><textarea rows={5} value={negative} onChange={(event) => setNegative(event.target.value)} spellCheck={false} /></label><div className="two-cols"><label><span>Steps</span><input type="number" min="1" max="50" value={steps} onChange={(event) => setSteps(Number(event.target.value))} /></label><label><span>Guidance</span><input type="number" min="0" max="10" step="0.1" value={scale} onChange={(event) => setScale(Number(event.target.value))} /></label></div><label><span>采样器</span><select value={sampler} onChange={(event) => setSampler(event.target.value)}><option value="k_euler_ancestral">Euler Ancestral（推荐）</option><option value="k_euler">Euler</option><option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label><label><span>Seed <small>留空则随机</small></span><input type="number" min="0" max="4294967295" value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="随机" /></label></div>}
+            {advancedOpen && <div className="advanced-body"><label><span>模型</span><select value={model} onChange={(event) => { setModel(event.target.value); setVibes((current) => current.map((vibe) => vibe.source === "image" ? { ...vibe, encoding: undefined, encodingKey: undefined } : vibe)); }}><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></select></label><label><span>负面提示词 <small>自动保存在当前设备</small></span><textarea rows={5} value={negative} onChange={(event) => setNegative(event.target.value)} spellCheck={false} /></label><div className="two-cols"><label><span>Steps</span><input type="number" min="1" max="50" value={steps} onChange={(event) => setSteps(Number(event.target.value))} /></label><label><span>Guidance</span><input type="number" min="0" max="10" step="0.1" value={scale} onChange={(event) => setScale(Number(event.target.value))} /></label></div><label><span>采样器</span><select value={sampler} onChange={(event) => setSampler(event.target.value)}><option value="k_euler_ancestral">Euler Ancestral（推荐）</option><option value="k_euler">Euler</option><option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label><label><span>Seed <small>留空则随机</small></span><input type="number" min="0" max="4294967295" value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="随机" /></label></div>}
           </section>
 
           {error && <div className="message error-message" role="alert"><strong>没有生成成功</strong><span>{error}</span></div>}
@@ -808,6 +902,8 @@ export default function Home() {
       )}
 
       {activeTab === "create" && <div className="generate-dock"><button className="generate-button" type="button" disabled={busy} onClick={generate}>{busy ? <><span className="button-spinner" />{status || "处理中…"}</> : <><span>✦</span>生成 {generationCount} 张图片</>}</button><small>图片生成后会自动保存到图库</small></div>}
+
+      {appearanceOpen && <div className="appearance-modal" role="dialog" aria-modal="true" aria-label="顶部设计" onClick={() => setAppearanceOpen(false)}><section className="appearance-card" onClick={(event) => event.stopPropagation()}><div className="appearance-heading"><div><h2>顶部设计</h2><p>点击左上角图标可以随时回来修改</p></div><button type="button" onClick={() => setAppearanceOpen(false)} aria-label="关闭">×</button></div><div className="appearance-preview"><div className="brand-mark" style={{ background: brandColor }}>{brandLogo ? <img src={brandLogo} alt="预览图标" /> : brandIconText.trim().slice(0, 2) || "N"}</div><div><strong>{brandName.trim() || "JunNAI"}</strong><small>{brandSubtitle.trim() || "简单、直接的手机生图页"}</small></div></div><div className="appearance-fields"><label><span>网站名称</span><input value={brandName} maxLength={20} onChange={(event) => setBrandName(event.target.value)} placeholder="JunNAI" /></label><label><span>副标题</span><input value={brandSubtitle} maxLength={40} onChange={(event) => setBrandSubtitle(event.target.value)} placeholder="简单、直接的手机生图页" /></label><div className="appearance-row"><label><span>图标文字</span><input value={brandIconText} maxLength={2} onChange={(event) => setBrandIconText(event.target.value)} placeholder="N" disabled={Boolean(brandLogo)} /></label><label><span>图标颜色</span><input type="color" value={brandColor} onChange={(event) => setBrandColor(event.target.value)} /></label></div></div><div className="appearance-actions"><button type="button" onClick={() => brandLogoInput.current?.click()}>{brandLogo ? "更换图标图片" : "上传图标图片"}</button>{brandLogo && <button type="button" onClick={() => setBrandLogo("")}>移除图片</button>}<button type="button" className="reset-design" onClick={resetBrandDesign}>恢复默认</button></div><input ref={brandLogoInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importBrandLogo(event)} />{appearanceError && <p className="appearance-error">{appearanceError}</p>}<button type="button" className="appearance-done" onClick={() => setAppearanceOpen(false)}>完成</button></section></div>}
 
       {selectedImage && <div className="gallery-modal" role="dialog" aria-modal="true" aria-label="图库图片详情" onClick={() => setSelectedImage(null)}><div className="gallery-modal-card" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setSelectedImage(null)} aria-label="关闭">×</button><img src={selectedImage.imageUrl} alt="放大的 NAI 生成图" /><div className="gallery-meta"><div className="meta-row"><span>{selectedImage.width} × {selectedImage.height}</span><span>Seed {selectedImage.seed}</span><span>{formatTime(selectedImage.createdAt)}</span></div>{selectedImage.artistString && <div><strong>画师串</strong><p>{selectedImage.artistString}</p></div>}<div><strong>完整提示词</strong><p>{selectedImage.prompt}</p></div><div className="modal-actions"><a href={selectedImage.imageUrl} download={`nai-${selectedImage.seed}.png`}>下载原图</a><button onClick={() => void deleteGalleryImage(selectedImage)}>删除图片</button></div></div></div></div>}
     </main>
