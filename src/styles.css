@@ -104,6 +104,15 @@ button { -webkit-tap-highlight-color: transparent; }
 .artist-input { min-height: 80px; }
 .mini-switch { min-width: 57px; min-height: 30px; padding: 0 10px; color: #877c91; background: #f0edf3; border: 0; border-radius: 999px; font-size: 9px; font-weight: 750; }
 .mini-switch.on { color: white; background: #7558d9; box-shadow: 0 5px 14px rgba(99, 72, 195, .2); }
+.artist-preset-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; margin-bottom: 9px; }
+.artist-preset-picker select,
+.artist-preset-save input { width: 100%; min-width: 0; min-height: 41px; padding: 0 11px; color: var(--ink); background: #f8f6fa; border: 1px solid var(--line); border-radius: 11px; outline: 0; font-size: 11px; }
+.artist-preset-picker button,
+.artist-preset-save button { min-height: 41px; padding: 0 11px; color: #654bbb; background: #eee9fa; border: 0; border-radius: 11px; font-size: 10px; font-weight: 750; }
+.artist-preset-picker .delete-preset { color: #984d61; background: #f9eaee; }
+.artist-preset-picker button:disabled,
+.artist-preset-save button:disabled { opacity: .45; }
+.artist-preset-save { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; margin-top: 8px; }
 
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
 .section-heading.compact { margin-bottom: 12px; }
@@ -119,9 +128,14 @@ button { -webkit-tap-highlight-color: transparent; }
 .vibe-list { display: grid; gap: 10px; }
 .vibe-item { display: grid; grid-template-columns: 100px 1fr; gap: 12px; padding: 10px; background: #f8f6fa; border: 1px solid var(--line); border-radius: 17px; }
 .vibe-item > img { width: 100px; height: 122px; object-fit: cover; border-radius: 12px; background: #eae6ee; }
+.json-vibe-preview { display: grid; place-items: center; align-content: center; width: 100px; height: 122px; gap: 5px; color: #684fc4; background: linear-gradient(145deg, #ede7fb, #f9f5ff); border: 1px solid #ded3f4; border-radius: 12px; }
+.json-vibe-preview strong { font-size: 13px; letter-spacing: .8px; }
+.json-vibe-preview small { color: #7b6d91; font-size: 8px; }
 .vibe-controls { min-width: 0; }
 .vibe-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.vibe-title > span { display: grid; min-width: 0; gap: 2px; }
 .vibe-title strong { font-size: 12px; }
+.vibe-title small { overflow: hidden; max-width: 155px; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .vibe-title button { padding: 4px; color: #a14e66; background: none; border: 0; font-size: 10px; }
 .vibe-controls label { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
 .vibe-controls label span { display: flex; justify-content: space-between; }
@@ -154,6 +168,12 @@ input[type="range"] { width: 100%; accent-color: var(--lavender); }
 .size-grid button > span:last-child { display: grid; gap: 4px; min-width: 0; }
 .size-grid strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .size-grid small { font-size: 8px; opacity: .82; }
+.custom-shape { display: grid; place-items: center; width: 34px; height: 26px; font-size: 13px; font-weight: 800; }
+.custom-size-panel { display: grid; grid-template-columns: 1fr 36px 1fr; align-items: end; gap: 7px; margin-top: 10px; padding: 11px; background: #f7f4fa; border: 1px solid var(--line); border-radius: 14px; }
+.custom-size-panel label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
+.custom-size-panel input { width: 100%; min-width: 0; height: 40px; padding: 0 9px; color: var(--ink); background: white; border: 1px solid #e4ddea; border-radius: 10px; outline: 0; font-size: 11px; }
+.custom-size-panel > button { width: 36px; height: 40px; color: #674cc3; background: #eee8fa; border: 0; border-radius: 10px; font-size: 16px; }
+.custom-size-panel > small { grid-column: 1 / -1; color: var(--muted); font-size: 8px; line-height: 1.4; }
 .quantity-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 13px; padding-top: 13px; border-top: 1px solid #f0ecf3; }
 .quantity-row > div:first-child { display: grid; gap: 4px; }
 .quantity-row strong { font-size: 12px; }
@@ -236,6 +256,7 @@ input[type="range"] { width: 100%; accent-color: var(--lavender); }
 @media (max-width: 380px) {
   .vibe-item { grid-template-columns: 84px 1fr; }
   .vibe-item > img { width: 84px; height: 112px; }
+  .json-vibe-preview { width: 84px; height: 112px; }
   .topbar { grid-template-columns: 38px 1fr auto; gap: 8px; padding-right: 10px; padding-left: 10px; }
   .brand-mark { width: 38px; height: 38px; border-radius: 12px; }
   .topbar p { display: none; }

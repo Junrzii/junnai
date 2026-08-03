@@ -4,19 +4,32 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { unzipSync } from "fflate";
 
-type SizeKey =
+type PresetSizeKey =
   | "portrait"
   | "square"
   | "landscape"
   | "phonePortrait"
   | "phoneLandscape"
   | "tall"
-  | "wide";
+  | "wide"
+  | "smallPortrait"
+  | "smallSquare"
+  | "smallLandscape";
+
+type SizeKey = PresetSizeKey | "custom";
+
+type ArtistPreset = {
+  id: string;
+  name: string;
+  value: string;
+};
 
 type VibeItem = {
   id: string;
-  file: File;
-  preview: string;
+  source: "image" | "json";
+  name: string;
+  file?: File;
+  preview?: string;
   strength: number;
   information: number;
   encoding?: string;
@@ -38,7 +51,10 @@ type GalleryItem = {
 
 type GalleryRecord = Omit<GalleryItem, "imageUrl"> & { blob: Blob };
 
-const sizes: Record<SizeKey, { width: number; height: number; label: string; hint: string }> = {
+const sizes: Record<PresetSizeKey, { width: number; height: number; label: string; hint: string }> = {
+  smallPortrait: { width: 512, height: 768, label: "小图竖版", hint: "512 × 768" },
+  smallSquare: { width: 640, height: 640, label: "小图方形", hint: "640 × 640" },
+  smallLandscape: { width: 768, height: 512, label: "小图横版", hint: "768 × 512" },
   portrait: { width: 832, height: 1216, label: "标准竖图", hint: "832 × 1216" },
   square: { width: 1024, height: 1024, label: "正方形", hint: "1024 × 1024" },
   landscape: { width: 1216, height: 832, label: "标准横图", hint: "1216 × 832" },
@@ -47,6 +63,79 @@ const sizes: Record<SizeKey, { width: number; height: number; label: string; hin
   tall: { width: 704, height: 1408, label: "超长竖图", hint: "704 × 1408" },
   wide: { width: 1408, height: 704, label: "超宽横图", hint: "1408 × 704" },
 };
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+function normalizeDimension(value: number) {
+  return Math.round(clampNumber(value, 512, 256, 2048) / 64) * 64;
+}
+
+function cleanEncoding(value: unknown) {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^data:[^;]+;base64,/, "");
+}
+
+function parseVibeJson(data: unknown, fileName: string) {
+  if (!data || typeof data !== "object") throw new Error(`${fileName} 不是有效的 Vibe JSON。`);
+  const root = data as Record<string, unknown>;
+  const parameterSource =
+    root.parameters && typeof root.parameters === "object"
+      ? (root.parameters as Record<string, unknown>)
+      : root;
+  const arrayEncodings =
+    parameterSource.reference_image_multiple ??
+    parameterSource.encodings ??
+    parameterSource.vibe_encodings;
+
+  if (Array.isArray(arrayEncodings)) {
+    const strengths = parameterSource.reference_strength_multiple;
+    const information = parameterSource.reference_information_extracted_multiple;
+    return arrayEncodings
+      .map((encoding, index) => ({
+        encoding: cleanEncoding(encoding),
+        name: `${fileName.replace(/\.json$/i, "")} ${index + 1}`,
+        strength: clampNumber(Array.isArray(strengths) ? strengths[index] : undefined, 0.6, 0, 1),
+        information: clampNumber(Array.isArray(information) ? information[index] : undefined, 1, 0.1, 1),
+      }))
+      .filter((item) => item.encoding);
+  }
+
+  const candidates = Array.isArray(root.vibes)
+    ? root.vibes
+    : Array.isArray(root.items)
+      ? root.items
+      : Array.isArray(data)
+        ? data
+        : [root.vibe && typeof root.vibe === "object" ? root.vibe : root];
+
+  return candidates
+    .map((candidate, index) => {
+      if (!candidate || typeof candidate !== "object") return null;
+      const item = candidate as Record<string, unknown>;
+      const encoding = cleanEncoding(
+        item.encoding ?? item.vibe_encoding ?? item.reference_image ?? item.referenceImage,
+      );
+      if (!encoding) return null;
+      return {
+        encoding,
+        name:
+          (typeof item.name === "string" && item.name.trim()) ||
+          `${fileName.replace(/\.json$/i, "")} ${index + 1}`,
+        strength: clampNumber(item.strength ?? item.reference_strength, 0.6, 0, 1),
+        information: clampNumber(
+          item.information ?? item.information_extracted ?? item.reference_information_extracted,
+          1,
+          0.1,
+          1,
+        ),
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+}
 
 const defaultNegative =
   "lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract]";
@@ -202,9 +291,14 @@ export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [artistString, setArtistString] = useState("");
   const [artistEnabled, setArtistEnabled] = useState(true);
+  const [artistPresets, setArtistPresets] = useState<ArtistPreset[]>([]);
+  const [selectedArtistPresetId, setSelectedArtistPresetId] = useState("");
+  const [artistPresetName, setArtistPresetName] = useState("");
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [negative, setNegative] = useState(defaultNegative);
   const [sizeKey, setSizeKey] = useState<SizeKey>("portrait");
+  const [customWidth, setCustomWidth] = useState(832);
+  const [customHeight, setCustomHeight] = useState(1216);
   const [generationCount, setGenerationCount] = useState(1);
   const [model, setModel] = useState("nai-diffusion-4-5-full");
   const [steps, setSteps] = useState(28);
@@ -229,8 +323,19 @@ export default function Home() {
       setApiKey(sessionStorage.getItem("nai-vibe-key") ?? "");
       setArtistString(localStorage.getItem("nai-artist-string") ?? "");
       setArtistEnabled(localStorage.getItem("nai-artist-enabled") !== "false");
+      try {
+        const savedPresets = JSON.parse(localStorage.getItem("nai-artist-presets") ?? "[]");
+        if (Array.isArray(savedPresets)) setArtistPresets(savedPresets.slice(0, 50));
+      } catch {
+        localStorage.removeItem("nai-artist-presets");
+      }
+      setSelectedArtistPresetId(localStorage.getItem("nai-artist-selected") ?? "");
       const savedCount = Number(localStorage.getItem("nai-generation-count"));
       if ([1, 2, 3, 4].includes(savedCount)) setGenerationCount(savedCount);
+      const savedWidth = Number(localStorage.getItem("nai-custom-width"));
+      const savedHeight = Number(localStorage.getItem("nai-custom-height"));
+      if (Number.isFinite(savedWidth)) setCustomWidth(normalizeDimension(savedWidth));
+      if (Number.isFinite(savedHeight)) setCustomHeight(normalizeDimension(savedHeight));
       setPreferencesReady(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -242,15 +347,37 @@ export default function Home() {
     else sessionStorage.removeItem("nai-vibe-key");
     localStorage.setItem("nai-artist-string", artistString);
     localStorage.setItem("nai-artist-enabled", String(artistEnabled));
+    localStorage.setItem("nai-artist-presets", JSON.stringify(artistPresets));
+    localStorage.setItem("nai-artist-selected", selectedArtistPresetId);
     localStorage.setItem("nai-generation-count", String(generationCount));
-  }, [apiKey, artistEnabled, artistString, generationCount, preferencesReady]);
+    localStorage.setItem("nai-custom-width", String(customWidth));
+    localStorage.setItem("nai-custom-height", String(customHeight));
+  }, [
+    apiKey,
+    artistEnabled,
+    artistPresets,
+    artistString,
+    customHeight,
+    customWidth,
+    generationCount,
+    preferencesReady,
+    selectedArtistPresetId,
+  ]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadGallery(), 0);
     return () => window.clearTimeout(timer);
   }, []);
 
-  const size = sizes[sizeKey];
+  const size =
+    sizeKey === "custom"
+      ? {
+          width: normalizeDimension(customWidth),
+          height: normalizeDimension(customHeight),
+          label: "自定义尺寸",
+          hint: `${normalizeDimension(customWidth)} × ${normalizeDimension(customHeight)}`,
+        }
+      : sizes[sizeKey];
   const strengthTotal = useMemo(
     () => vibes.reduce((sum, vibe) => sum + vibe.strength, 0),
     [vibes],
@@ -295,6 +422,50 @@ export default function Home() {
     setSelectedImage(null);
   }
 
+  function selectArtistPreset(id: string) {
+    setSelectedArtistPresetId(id);
+    if (!id) {
+      setArtistPresetName("");
+      return;
+    }
+    const preset = artistPresets.find((item) => item.id === id);
+    if (!preset) return;
+    setArtistPresetName(preset.name);
+    setArtistString(preset.value);
+    setArtistEnabled(true);
+  }
+
+  function saveArtistPreset() {
+    const name = artistPresetName.trim();
+    const value = artistString.trim();
+    if (!name || !value) return;
+    if (selectedArtistPresetId) {
+      setArtistPresets((current) =>
+        current.map((preset) =>
+          preset.id === selectedArtistPresetId ? { ...preset, name, value } : preset,
+        ),
+      );
+      return;
+    }
+    const preset = { id: crypto.randomUUID(), name, value };
+    setArtistPresets((current) => [...current, preset]);
+    setSelectedArtistPresetId(preset.id);
+  }
+
+  function newArtistPreset() {
+    setSelectedArtistPresetId("");
+    setArtistPresetName("");
+    setArtistString("");
+  }
+
+  function deleteArtistPreset() {
+    if (!selectedArtistPresetId) return;
+    setArtistPresets((current) =>
+      current.filter((preset) => preset.id !== selectedArtistPresetId),
+    );
+    newArtistPreset();
+  }
+
   function updateVibe(id: string, update: Partial<VibeItem>, resetEncoding = false) {
     setVibes((current) =>
       current.map((vibe) =>
@@ -302,7 +473,9 @@ export default function Home() {
           ? {
               ...vibe,
               ...update,
-              ...(resetEncoding ? { encoding: undefined, encodingKey: undefined } : {}),
+              ...(resetEncoding && vibe.source === "image"
+                ? { encoding: undefined, encodingKey: undefined }
+                : {}),
             }
           : vibe,
       ),
@@ -312,7 +485,7 @@ export default function Home() {
   function removeVibe(id: string) {
     setVibes((current) => {
       const target = current.find((item) => item.id === id);
-      if (target) URL.revokeObjectURL(target.preview);
+      if (target?.preview) URL.revokeObjectURL(target.preview);
       return current.filter((item) => item.id !== id);
     });
   }
@@ -322,29 +495,59 @@ export default function Home() {
     setResults([]);
   }
 
-  function addVibes(event: ChangeEvent<HTMLInputElement>) {
-    const picked = Array.from(event.target.files ?? []).slice(
-      0,
-      Math.max(0, 4 - vibes.length),
-    );
+  async function addVibes(event: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
     if (!picked.length) return;
-    setVibes((current) => [
-      ...current,
-      ...picked.map((file) => ({
+    const additions: VibeItem[] = [];
+    let importError = "";
+
+    for (const file of picked) {
+      if (vibes.length + additions.length >= 4) break;
+      if (file.type === "application/json" || file.name.toLowerCase().endsWith(".json")) {
+        try {
+          const parsed = parseVibeJson(JSON.parse(await file.text()), file.name);
+          for (const item of parsed) {
+            if (vibes.length + additions.length >= 4) break;
+            additions.push({
+              id: crypto.randomUUID(),
+              source: "json",
+              name: item.name,
+              strength: item.strength,
+              information: item.information,
+              encoding: item.encoding,
+            });
+          }
+          if (!parsed.length) importError = `${file.name} 中没有找到可识别的 Vibe encoding。`;
+        } catch (caught) {
+          importError = caught instanceof Error ? caught.message : `${file.name} 读取失败。`;
+        }
+        continue;
+      }
+      if (!file.type.startsWith("image/")) {
+        importError = `${file.name} 不是支持的图片或 JSON 文件。`;
+        continue;
+      }
+      additions.push({
         id: crypto.randomUUID(),
+        source: "image",
+        name: file.name,
         file,
         preview: URL.createObjectURL(file),
         strength: 0.6,
         information: 1,
-      })),
-    ]);
-    event.target.value = "";
-    setError("");
+      });
+    }
+
+    if (additions.length) setVibes((current) => [...current, ...additions].slice(0, 4));
+    setError(importError);
   }
 
   async function encodeVibe(vibe: VibeItem, key: string) {
+    if (vibe.source === "json" && vibe.encoding) return vibe.encoding;
     const encodingKey = `${model}:${vibe.information}`;
     if (vibe.encoding && vibe.encodingKey === encodingKey) return vibe.encoding;
+    if (!vibe.file) throw new Error(`${vibe.name} 缺少图片或有效 encoding。`);
     const image = await prepareVibeImage(vibe.file);
     const response = await fetch("https://image.novelai.net/ai/encode-vibe", {
       method: "POST",
@@ -537,39 +740,65 @@ export default function Home() {
             <div className="prompt-tools"><span>{prompt.length} 字符</span><button type="button" onClick={() => setPrompt("")} disabled={!prompt}>清空</button></div>
             <div className="artist-divider" />
             <div className="artist-heading"><label htmlFor="artist-string"><span>画师串</span><small>自动放在每次提示词最前面</small></label><button type="button" className={`mini-switch ${artistEnabled ? "on" : ""}`} onClick={() => setArtistEnabled((value) => !value)} aria-pressed={artistEnabled}>{artistEnabled ? "已启用" : "未启用"}</button></div>
+            <div className="artist-preset-picker">
+              <select value={selectedArtistPresetId} onChange={(event) => selectArtistPreset(event.target.value)} aria-label="选择画师串预设">
+                <option value="">选择已保存的画师串</option>
+                {artistPresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
+              </select>
+              <button type="button" onClick={newArtistPreset}>新建</button>
+              <button type="button" className="delete-preset" disabled={!selectedArtistPresetId} onClick={deleteArtistPreset}>删除</button>
+            </div>
             <textarea id="artist-string" className="artist-input" value={artistString} onChange={(event) => setArtistString(event.target.value)} placeholder="例如：artist:name, year 2024, amazing quality" rows={3} spellCheck={false} />
-            <p className="helper">输入后会自动保存到当前设备，不用每次重新粘贴。</p>
+            <div className="artist-preset-save">
+              <input value={artistPresetName} onChange={(event) => setArtistPresetName(event.target.value)} placeholder="预设名称，例如：厚涂画师串" />
+              <button type="button" disabled={!artistPresetName.trim() || !artistString.trim()} onClick={saveArtistPreset}>{selectedArtistPresetId ? "更新预设" : "保存预设"}</button>
+            </div>
+            <p className="helper">画师串和预设都保存在当前设备，选择名称即可立即切换。</p>
           </section>
 
           <section className="control-card vibe-card">
-            <div className="section-heading"><div><h2>Vibe 参考图</h2><p>参考画风、色彩与构图，最多 4 张</p></div><span className="optional">可选</span></div>
+            <div className="section-heading"><div><h2>Vibe 参考</h2><p>支持图片和带 encoding 的 JSON，最多 4 个</p></div><span className="optional">可选</span></div>
             {vibes.length === 0 ? (
-              <button className="vibe-upload" type="button" onClick={() => fileInput.current?.click()}><span className="upload-icon">＋</span><span><strong>添加 Vibe 图片</strong><small>JPG、PNG 或 WebP</small></span></button>
+              <button className="vibe-upload" type="button" onClick={() => fileInput.current?.click()}><span className="upload-icon">＋</span><span><strong>导入 Vibe</strong><small>JPG、PNG、WebP 或 JSON</small></span></button>
             ) : (
               <div className="vibe-list">
                 {vibes.map((vibe, index) => (
-                  <article className="vibe-item" key={vibe.id}><img src={vibe.preview} alt={`Vibe 参考图 ${index + 1}`} /><div className="vibe-controls"><div className="vibe-title"><strong>Vibe {index + 1}</strong><button onClick={() => removeVibe(vibe.id)}>移除</button></div><label><span>影响强度 <b>{vibe.strength.toFixed(2)}</b></span><input type="range" min="0" max="1" step="0.05" value={vibe.strength} onChange={(event) => updateVibe(vibe.id, { strength: Number(event.target.value) })} /></label><details><summary>信息提取：{vibe.information.toFixed(2)}</summary><input type="range" min="0.1" max="1" step="0.05" value={vibe.information} onChange={(event) => updateVibe(vibe.id, { information: Number(event.target.value) }, true)} /><small>修改后会重新编码，并再次消耗编码费用。</small></details></div></article>
+                  <article className="vibe-item" key={vibe.id}>
+                    {vibe.preview ? <img src={vibe.preview} alt={`Vibe 参考图 ${index + 1}`} /> : <div className="json-vibe-preview"><strong>JSON</strong><small>已导入编码</small></div>}
+                    <div className="vibe-controls">
+                      <div className="vibe-title"><span><strong>Vibe {index + 1}</strong><small>{vibe.name}</small></span><button onClick={() => removeVibe(vibe.id)}>移除</button></div>
+                      <label><span>影响强度 <b>{vibe.strength.toFixed(2)}</b></span><input type="range" min="0" max="1" step="0.05" value={vibe.strength} onChange={(event) => updateVibe(vibe.id, { strength: Number(event.target.value) })} /></label>
+                      <details><summary>信息提取：{vibe.information.toFixed(2)}</summary><input type="range" min="0.1" max="1" step="0.05" value={vibe.information} onChange={(event) => updateVibe(vibe.id, { information: Number(event.target.value) }, true)} /><small>{vibe.source === "json" ? "JSON 已含编码，修改数值不会重新编码。" : "修改后会重新编码，并再次消耗编码费用。"}</small></details>
+                    </div>
+                  </article>
                 ))}
-                {vibes.length < 4 && <button className="add-another" type="button" onClick={() => fileInput.current?.click()}>＋ 再添加一张</button>}
+                {vibes.length < 4 && <button className="add-another" type="button" onClick={() => fileInput.current?.click()}>＋ 再导入一个</button>}
               </div>
             )}
-            <input ref={fileInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={addVibes} />
-            {vibes.length > 0 && <div className={`vibe-note ${strengthTotal > 1 ? "warning" : ""}`}><span>首次编码每张 Vibe 通常消耗 2 Anlas</span><strong>总强度 {strengthTotal.toFixed(2)}</strong>{strengthTotal > 1 && <small>建议把总强度调到 1.00 以内</small>}</div>}
+            <input ref={fileInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,application/json,.json" multiple onChange={(event) => void addVibes(event)} />
+            {vibes.length > 0 && <div className={`vibe-note ${strengthTotal > 1 ? "warning" : ""}`}><span>图片 Vibe 首次编码通常消耗 2 Anlas；JSON 编码可直接使用</span><strong>总强度 {strengthTotal.toFixed(2)}</strong>{strengthTotal > 1 && <small>建议把总强度调到 1.00 以内</small>}</div>}
           </section>
 
           <section className="control-card">
             <div className="section-heading compact"><div><h2>尺寸与数量</h2><p>尺寸越大、一次生成越多，消耗通常越高</p></div></div>
             <div className="size-grid">
-              {(Object.keys(sizes) as SizeKey[]).map((item) => (
+              {(Object.keys(sizes) as PresetSizeKey[]).map((item) => (
                 <button key={item} type="button" className={sizeKey === item ? "active" : ""} onClick={() => setSizeKey(item)}><span className="size-shape" style={shapeStyle(sizes[item].width, sizes[item].height)} /><span><strong>{sizes[item].label}</strong><small>{sizes[item].hint}</small></span></button>
               ))}
+              <button type="button" className={sizeKey === "custom" ? "active" : ""} onClick={() => setSizeKey("custom")}><span className="size-shape custom-shape">↔</span><span><strong>自定义</strong><small>{normalizeDimension(customWidth)} × {normalizeDimension(customHeight)}</small></span></button>
             </div>
+            {sizeKey === "custom" && <div className="custom-size-panel">
+              <label><span>宽度</span><input type="number" min="256" max="2048" step="64" value={customWidth} onChange={(event) => setCustomWidth(Number(event.target.value))} onBlur={() => setCustomWidth(normalizeDimension(customWidth))} /></label>
+              <button type="button" aria-label="交换宽高" onClick={() => { setCustomWidth(customHeight); setCustomHeight(customWidth); }}>⇄</button>
+              <label><span>高度</span><input type="number" min="256" max="2048" step="64" value={customHeight} onChange={(event) => setCustomHeight(Number(event.target.value))} onBlur={() => setCustomHeight(normalizeDimension(customHeight))} /></label>
+              <small>会自动取最接近的 64 倍数，范围 256–2048。</small>
+            </div>}
             <div className="quantity-row"><div><strong>生成数量</strong><small>一次生成 1–4 张</small></div><div className="quantity-control" aria-label="生成数量">{[1, 2, 3, 4].map((count) => <button key={count} className={generationCount === count ? "active" : ""} onClick={() => setGenerationCount(count)}>{count}</button>)}</div></div>
           </section>
 
           <section className="control-card advanced-card">
             <button className="advanced-toggle" type="button" onClick={() => setAdvancedOpen((value) => !value)} aria-expanded={advancedOpen}><span><strong>高级设置</strong><small>一般保持默认就可以</small></span><b>{advancedOpen ? "收起" : "展开"}</b></button>
-            {advancedOpen && <div className="advanced-body"><label><span>模型</span><select value={model} onChange={(event) => { setModel(event.target.value); setVibes((current) => current.map((vibe) => ({ ...vibe, encoding: undefined, encodingKey: undefined }))); }}><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></select></label><label><span>负面提示词</span><textarea rows={5} value={negative} onChange={(event) => setNegative(event.target.value)} spellCheck={false} /></label><div className="two-cols"><label><span>Steps</span><input type="number" min="1" max="50" value={steps} onChange={(event) => setSteps(Number(event.target.value))} /></label><label><span>Guidance</span><input type="number" min="0" max="10" step="0.1" value={scale} onChange={(event) => setScale(Number(event.target.value))} /></label></div><label><span>采样器</span><select value={sampler} onChange={(event) => setSampler(event.target.value)}><option value="k_euler_ancestral">Euler Ancestral（推荐）</option><option value="k_euler">Euler</option><option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label><label><span>Seed <small>留空则随机</small></span><input type="number" min="0" max="4294967295" value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="随机" /></label></div>}
+            {advancedOpen && <div className="advanced-body"><label><span>模型</span><select value={model} onChange={(event) => { setModel(event.target.value); setVibes((current) => current.map((vibe) => vibe.source === "image" ? { ...vibe, encoding: undefined, encodingKey: undefined } : vibe)); }}><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></select></label><label><span>负面提示词</span><textarea rows={5} value={negative} onChange={(event) => setNegative(event.target.value)} spellCheck={false} /></label><div className="two-cols"><label><span>Steps</span><input type="number" min="1" max="50" value={steps} onChange={(event) => setSteps(Number(event.target.value))} /></label><label><span>Guidance</span><input type="number" min="0" max="10" step="0.1" value={scale} onChange={(event) => setScale(Number(event.target.value))} /></label></div><label><span>采样器</span><select value={sampler} onChange={(event) => setSampler(event.target.value)}><option value="k_euler_ancestral">Euler Ancestral（推荐）</option><option value="k_euler">Euler</option><option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label><label><span>Seed <small>留空则随机</small></span><input type="number" min="0" max="4294967295" value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="随机" /></label></div>}
           </section>
 
           {error && <div className="message error-message" role="alert"><strong>没有生成成功</strong><span>{error}</span></div>}
