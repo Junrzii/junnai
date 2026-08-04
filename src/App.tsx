@@ -22,7 +22,19 @@ type ArtistPreset = {
   id: string;
   name: string;
   value: string;
+  exampleImage?: string;
 };
+
+type CharacterPreset = {
+  id: string;
+  name: string;
+  prompt: string;
+  exampleImage?: string;
+};
+
+type ActiveTab = "create" | "artists" | "characters" | "gallery";
+type ApiProvider = "official" | "custom";
+type CustomAuthMode = "bearer" | "x-api-key" | "raw";
 
 type VibeItem = {
   id: string;
@@ -101,6 +113,38 @@ function prepareBrandLogo(file: File) {
     };
     image.src = source;
   });
+}
+
+function prepareLibraryImage(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const source = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      if (!context) {
+        URL.revokeObjectURL(source);
+        reject(new Error("当前浏览器无法处理这张图片。"));
+        return;
+      }
+      const scale = Math.min(1, 384 / Math.max(image.naturalWidth, image.naturalHeight));
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(source);
+      resolve(canvas.toDataURL("image/webp", 0.65));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(source);
+      reject(new Error("图片读取失败，请换一张 PNG、JPG 或 WebP。"));
+    };
+    image.src = source;
+  });
+}
+
+function joinEndpoint(baseUrl: string, path: string) {
+  if (/^https?:\/\//i.test(path.trim())) return path.trim();
+  return `${baseUrl.trim().replace(/\/+$/, "")}/${path.trim().replace(/^\/+/, "")}`;
 }
 
 function cleanEncoding(value: unknown) {
@@ -244,12 +288,72 @@ async function prepareVibeImage(file: File) {
 }
 
 function friendlyError(status: number, detail: string) {
-  if (status === 401) return "Key 无效或已经失效，请重新检查 pst- Key。";
+  if (status === 401) return "Key 无效或已经失效，请重新检查当前连接使用的 Key。";
   if (status === 402) return "Anlas 余额不足，暂时无法完成这次生成。";
   if (status === 429) return "请求太频繁了，稍等一会儿再试。";
   if (status === 400 || status === 422)
     return `参数没有被 NAI 接受。${detail ? ` ${detail}` : ""}`;
   return `生成失败（${status}）。${detail ? ` ${detail}` : "请稍后重试。"}`;
+}
+
+function base64ToBlob(value: string, type = "image/png") {
+  const clean = value.replace(/^data:[^;]+;base64,/, "");
+  const bytes = Uint8Array.from(atob(clean), (character) => character.charCodeAt(0));
+  return new Blob([bytes], { type });
+}
+
+async function readGeneratedImages(response: Response) {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const data = await response.json() as Record<string, unknown>;
+    const nestedData = Array.isArray(data.data) ? data.data : [];
+    const images = Array.isArray(data.images) ? data.images : [];
+    const candidates = [
+      ...nestedData,
+      ...images,
+      data.image,
+      data.url,
+      data.b64_json,
+      data.base64,
+      data.output,
+    ].filter(Boolean);
+    const blobs: Blob[] = [];
+    for (const candidate of candidates) {
+      const record = candidate && typeof candidate === "object"
+        ? candidate as Record<string, unknown>
+        : null;
+      const value = typeof candidate === "string"
+        ? candidate
+        : String(record?.b64_json ?? record?.base64 ?? record?.image ?? record?.url ?? "");
+      if (!value) continue;
+      if (/^https?:\/\//i.test(value)) {
+        const imageResponse = await fetch(value);
+        if (!imageResponse.ok) throw new Error("第三方接口返回了图片地址，但浏览器无法读取该图片。");
+        blobs.push(await imageResponse.blob());
+      } else {
+        blobs.push(base64ToBlob(value));
+      }
+    }
+    if (!blobs.length) throw new Error("第三方接口已返回 JSON，但没有找到图片 URL 或 Base64 数据。");
+    return blobs;
+  }
+
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (contentType.startsWith("image/")) return [new Blob([bytes], { type: contentType })];
+  try {
+    const files = unzipSync(bytes);
+    const entries = Object.entries(files)
+      .filter(([name]) => /\.(png|jpe?g|webp)$/i.test(name))
+      .sort(([a], [b]) => a.localeCompare(b));
+    if (!entries.length) throw new Error("压缩包中没有图片");
+    return entries.map(([name, imageBytes]) => new Blob([imageBytes as BlobPart], {
+      type: name.toLowerCase().endsWith(".webp")
+        ? "image/webp"
+        : /\.jpe?g$/i.test(name) ? "image/jpeg" : "image/png",
+    }));
+  } catch {
+    throw new Error("接口已返回结果，但不是可识别的图片、JSON 或 ZIP。请检查第三方接口兼容性。");
+  }
 }
 
 function shapeStyle(width: number, height: number) {
@@ -314,8 +418,15 @@ async function removeGalleryRecord(id: string) {
 }
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"create" | "gallery">("create");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("create");
+  const [apiProvider, setApiProvider] = useState<ApiProvider>("official");
   const [apiKey, setApiKey] = useState("");
+  const [customApiKey, setCustomApiKey] = useState("");
+  const [customBaseUrl, setCustomBaseUrl] = useState("");
+  const [customGeneratePath, setCustomGeneratePath] = useState("/ai/generate-image");
+  const [customEncodePath, setCustomEncodePath] = useState("/ai/encode-vibe");
+  const [customModel, setCustomModel] = useState("nai-diffusion-4-5-full");
+  const [customAuthMode, setCustomAuthMode] = useState<CustomAuthMode>("bearer");
   const [showKey, setShowKey] = useState(false);
   const [brandName, setBrandName] = useState("JunNAI");
   const [brandSubtitle, setBrandSubtitle] = useState("简单、直接的手机生图页");
@@ -330,6 +441,15 @@ export default function Home() {
   const [artistPresets, setArtistPresets] = useState<ArtistPreset[]>([]);
   const [selectedArtistPresetId, setSelectedArtistPresetId] = useState("");
   const [artistPresetName, setArtistPresetName] = useState("");
+  const [artistExampleImage, setArtistExampleImage] = useState("");
+  const [characters, setCharacters] = useState<CharacterPreset[]>([]);
+  const [selectedCharacterId, setSelectedCharacterId] = useState("");
+  const [editingCharacterId, setEditingCharacterId] = useState("");
+  const [characterName, setCharacterName] = useState("");
+  const [characterPrompt, setCharacterPrompt] = useState("");
+  const [characterExampleImage, setCharacterExampleImage] = useState("");
+  const [characterSearch, setCharacterSearch] = useState("");
+  const [copiedCharacterId, setCopiedCharacterId] = useState("");
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [negative, setNegative] = useState(defaultNegative);
   const [sizeKey, setSizeKey] = useState<SizeKey>("portrait");
@@ -354,6 +474,8 @@ export default function Home() {
   const [selectedImage, setSelectedImage] = useState<GalleryItem | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const brandLogoInput = useRef<HTMLInputElement>(null);
+  const artistExampleInput = useRef<HTMLInputElement>(null);
+  const characterExampleInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -367,15 +489,35 @@ export default function Home() {
       setBrandIconText(localStorage.getItem("nai-brand-icon-text") ?? "N");
       setBrandColor(localStorage.getItem("nai-brand-color") ?? "#6f50dd");
       setBrandLogo(localStorage.getItem("nai-brand-logo") ?? "");
+      setApiProvider(localStorage.getItem("nai-api-provider") === "custom" ? "custom" : "official");
+      setCustomApiKey(localStorage.getItem("nai-custom-api-key") ?? "");
+      setCustomBaseUrl(localStorage.getItem("nai-custom-base-url") ?? "");
+      setCustomGeneratePath(localStorage.getItem("nai-custom-generate-path") ?? "/ai/generate-image");
+      setCustomEncodePath(localStorage.getItem("nai-custom-encode-path") ?? "/ai/encode-vibe");
+      setCustomModel(localStorage.getItem("nai-custom-model") ?? "nai-diffusion-4-5-full");
+      const savedAuthMode = localStorage.getItem("nai-custom-auth-mode");
+      if (savedAuthMode === "x-api-key" || savedAuthMode === "raw") setCustomAuthMode(savedAuthMode);
       setArtistString(localStorage.getItem("nai-artist-string") ?? "");
       setArtistEnabled(localStorage.getItem("nai-artist-enabled") !== "false");
       try {
-        const savedPresets = JSON.parse(localStorage.getItem("nai-artist-presets") ?? "[]");
-        if (Array.isArray(savedPresets)) setArtistPresets(savedPresets.slice(0, 50));
+        const savedPresets = JSON.parse(localStorage.getItem("nai-artist-presets") ?? "[]") as ArtistPreset[];
+        const savedArtistId = localStorage.getItem("nai-artist-selected") ?? "";
+        if (Array.isArray(savedPresets)) {
+          const presets = savedPresets.slice(0, 50);
+          setArtistPresets(presets);
+          setArtistExampleImage(presets.find((item) => item.id === savedArtistId)?.exampleImage ?? "");
+        }
+        setSelectedArtistPresetId(savedArtistId);
       } catch {
         localStorage.removeItem("nai-artist-presets");
       }
-      setSelectedArtistPresetId(localStorage.getItem("nai-artist-selected") ?? "");
+      try {
+        const savedCharacters = JSON.parse(localStorage.getItem("nai-character-presets") ?? "[]");
+        if (Array.isArray(savedCharacters)) setCharacters(savedCharacters.slice(0, 40));
+      } catch {
+        localStorage.removeItem("nai-character-presets");
+      }
+      setSelectedCharacterId(localStorage.getItem("nai-character-selected") ?? "");
       const savedCount = Number(localStorage.getItem("nai-generation-count"));
       if ([1, 2, 3, 4, 5, 6].includes(savedCount)) setGenerationCount(savedCount);
       const savedWidth = Number(localStorage.getItem("nai-custom-width"));
@@ -391,6 +533,14 @@ export default function Home() {
     if (!preferencesReady) return;
     if (apiKey) localStorage.setItem("nai-vibe-key", apiKey);
     else localStorage.removeItem("nai-vibe-key");
+    localStorage.setItem("nai-api-provider", apiProvider);
+    if (customApiKey) localStorage.setItem("nai-custom-api-key", customApiKey);
+    else localStorage.removeItem("nai-custom-api-key");
+    localStorage.setItem("nai-custom-base-url", customBaseUrl);
+    localStorage.setItem("nai-custom-generate-path", customGeneratePath);
+    localStorage.setItem("nai-custom-encode-path", customEncodePath);
+    localStorage.setItem("nai-custom-model", customModel);
+    localStorage.setItem("nai-custom-auth-mode", customAuthMode);
     localStorage.setItem("nai-negative-prompt", negative);
     localStorage.setItem("nai-brand-name", brandName);
     localStorage.setItem("nai-brand-subtitle", brandSubtitle);
@@ -402,11 +552,14 @@ export default function Home() {
     localStorage.setItem("nai-artist-enabled", String(artistEnabled));
     localStorage.setItem("nai-artist-presets", JSON.stringify(artistPresets));
     localStorage.setItem("nai-artist-selected", selectedArtistPresetId);
+    localStorage.setItem("nai-character-presets", JSON.stringify(characters));
+    localStorage.setItem("nai-character-selected", selectedCharacterId);
     localStorage.setItem("nai-generation-count", String(generationCount));
     localStorage.setItem("nai-custom-width", String(customWidth));
     localStorage.setItem("nai-custom-height", String(customHeight));
   }, [
     apiKey,
+    apiProvider,
     artistEnabled,
     artistPresets,
     artistString,
@@ -415,12 +568,20 @@ export default function Home() {
     brandLogo,
     brandName,
     brandSubtitle,
+    characters,
+    customApiKey,
+    customAuthMode,
+    customBaseUrl,
+    customEncodePath,
+    customGeneratePath,
     customHeight,
+    customModel,
     customWidth,
     generationCount,
     negative,
     preferencesReady,
     selectedArtistPresetId,
+    selectedCharacterId,
   ]);
 
   useEffect(() => {
@@ -437,6 +598,14 @@ export default function Home() {
           hint: `${normalizeDimension(customWidth)} × ${normalizeDimension(customHeight)}`,
         }
       : sizes[sizeKey];
+  const activeApiKey = apiProvider === "official" ? apiKey : customApiKey;
+  const activeBaseUrl = apiProvider === "official" ? "https://image.novelai.net" : customBaseUrl;
+  const requestModel = apiProvider === "official" ? model : customModel.trim() || model;
+  const selectedCharacter = characters.find((item) => item.id === selectedCharacterId) ?? null;
+  const currentArtistPreset = artistPresets.find((item) => item.id === selectedArtistPresetId) ?? null;
+  const filteredCharacters = characters.filter((item) =>
+    `${item.name} ${item.prompt}`.toLowerCase().includes(characterSearch.trim().toLowerCase()),
+  );
   const isSmallPreset = sizeKey.startsWith("small");
   const opusUnlimitedReady = isSmallPreset && generationCount === 1 && steps <= 28;
   const quantityOptions = isSmallPreset ? [1, 2, 3, 4, 5, 6] : [1, 2, 3, 4];
@@ -448,6 +617,14 @@ export default function Home() {
   useEffect(() => {
     if (!isSmallPreset && generationCount > 4) setGenerationCount(4);
   }, [generationCount, isSmallPreset]);
+
+  function apiHeaders(key: string) {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiProvider === "official" || customAuthMode === "bearer") headers.Authorization = `Bearer ${key}`;
+    else if (customAuthMode === "x-api-key") headers["x-api-key"] = key;
+    else headers.Authorization = key;
+    return headers;
+  }
 
   async function importBrandLogo(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -517,12 +694,14 @@ export default function Home() {
     setSelectedArtistPresetId(id);
     if (!id) {
       setArtistPresetName("");
+      setArtistExampleImage("");
       return;
     }
     const preset = artistPresets.find((item) => item.id === id);
     if (!preset) return;
     setArtistPresetName(preset.name);
     setArtistString(preset.value);
+    setArtistExampleImage(preset.exampleImage ?? "");
     setArtistEnabled(true);
   }
 
@@ -533,12 +712,12 @@ export default function Home() {
     if (selectedArtistPresetId) {
       setArtistPresets((current) =>
         current.map((preset) =>
-          preset.id === selectedArtistPresetId ? { ...preset, name, value } : preset,
+          preset.id === selectedArtistPresetId ? { ...preset, name, value, exampleImage: artistExampleImage || undefined } : preset,
         ),
       );
       return;
     }
-    const preset = { id: crypto.randomUUID(), name, value };
+    const preset = { id: crypto.randomUUID(), name, value, exampleImage: artistExampleImage || undefined };
     setArtistPresets((current) => [...current, preset]);
     setSelectedArtistPresetId(preset.id);
   }
@@ -547,6 +726,7 @@ export default function Home() {
     setSelectedArtistPresetId("");
     setArtistPresetName("");
     setArtistString("");
+    setArtistExampleImage("");
   }
 
   function deleteArtistPreset() {
@@ -555,6 +735,83 @@ export default function Home() {
       current.filter((preset) => preset.id !== selectedArtistPresetId),
     );
     newArtistPreset();
+  }
+
+  async function importArtistExample(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("请选择 PNG、JPG 或 WebP 例图。");
+      return;
+    }
+    try {
+      setArtistExampleImage(await prepareLibraryImage(file));
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "画师串例图读取失败。");
+    }
+  }
+
+  function startNewCharacter() {
+    setEditingCharacterId("");
+    setCharacterName("");
+    setCharacterPrompt("");
+    setCharacterExampleImage("");
+  }
+
+  function editCharacter(character: CharacterPreset) {
+    setEditingCharacterId(character.id);
+    setCharacterName(character.name);
+    setCharacterPrompt(character.prompt);
+    setCharacterExampleImage(character.exampleImage ?? "");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function saveCharacter() {
+    const name = characterName.trim();
+    const characterValue = characterPrompt.trim();
+    if (!name || !characterValue) return;
+    if (editingCharacterId) {
+      setCharacters((current) => current.map((item) => item.id === editingCharacterId ? { ...item, name, prompt: characterValue, exampleImage: characterExampleImage || undefined } : item));
+    } else {
+      const character = { id: crypto.randomUUID(), name, prompt: characterValue, exampleImage: characterExampleImage || undefined };
+      setCharacters((current) => [character, ...current].slice(0, 40));
+      setEditingCharacterId(character.id);
+    }
+    setNotice("角色已保存在当前设备。");
+  }
+
+  function deleteCharacter(id: string) {
+    setCharacters((current) => current.filter((item) => item.id !== id));
+    if (selectedCharacterId === id) setSelectedCharacterId("");
+    if (editingCharacterId === id) startNewCharacter();
+  }
+
+  async function importCharacterExample(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("请选择 PNG、JPG 或 WebP 角色例图。");
+      return;
+    }
+    try {
+      setCharacterExampleImage(await prepareLibraryImage(file));
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "角色例图读取失败。");
+    }
+  }
+
+  async function copyCharacterPrompt(character: CharacterPreset) {
+    try {
+      await navigator.clipboard.writeText(character.prompt);
+      setCopiedCharacterId(character.id);
+      window.setTimeout(() => setCopiedCharacterId(""), 1400);
+    } catch {
+      setError("复制失败，请长按提示词手动复制。");
+    }
   }
 
   function updateVibe(id: string, update: Partial<VibeItem>, resetEncoding = false) {
@@ -636,32 +893,44 @@ export default function Home() {
 
   async function encodeVibe(vibe: VibeItem, key: string) {
     if (vibe.source === "json" && vibe.encoding) return vibe.encoding;
-    const encodingKey = `${model}:${vibe.information}`;
+    const encodingKey = `${apiProvider}:${activeBaseUrl}:${requestModel}:${vibe.information}`;
     if (vibe.encoding && vibe.encodingKey === encodingKey) return vibe.encoding;
     if (!vibe.file) throw new Error(`${vibe.name} 缺少图片或有效 encoding。`);
     const image = await prepareVibeImage(vibe.file);
-    const response = await fetch("https://image.novelai.net/ai/encode-vibe", {
+    const response = await fetch(joinEndpoint(activeBaseUrl, apiProvider === "official" ? "/ai/encode-vibe" : customEncodePath), {
       method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ image, model, information_extracted: vibe.information }),
+      headers: apiHeaders(key),
+      body: JSON.stringify({ image, model: requestModel, information_extracted: vibe.information }),
     });
     if (!response.ok) {
       const detail = await response.text();
       throw new Error(friendlyError(response.status, detail.slice(0, 180)));
     }
-    const encoding = bytesToBase64(new Uint8Array(await response.arrayBuffer()));
+    let encoding = "";
+    if ((response.headers.get("content-type") ?? "").includes("application/json")) {
+      const data = await response.json() as Record<string, unknown>;
+      const nested = data.data && typeof data.data === "object" ? data.data as Record<string, unknown> : {};
+      encoding = cleanEncoding(data.encoding ?? data.vibe_encoding ?? nested.encoding);
+    } else {
+      encoding = bytesToBase64(new Uint8Array(await response.arrayBuffer()));
+    }
+    if (!encoding) throw new Error("Vibe 编码接口没有返回可识别的 encoding。");
     updateVibe(vibe.id, { encoding, encodingKey });
     return encoding;
   }
 
   async function generate() {
-    const key = apiKey.trim();
+    const key = activeApiKey.trim();
     const basePrompt = prompt.replaceAll("\\", "").trim();
     const cleanArtist = artistString.replaceAll("\\", "").trim();
-    const combinedPrompt =
-      artistEnabled && cleanArtist ? `${cleanArtist}, ${basePrompt}` : basePrompt;
-    if (!key.startsWith("pst-")) {
-      setError("请先填写正确的 pst- 开头 Key。");
+    const cleanCharacter = selectedCharacter?.prompt.replaceAll("\\", "").trim() ?? "";
+    const combinedPrompt = [artistEnabled ? cleanArtist : "", cleanCharacter, basePrompt].filter(Boolean).join(", ");
+    if (!key || (apiProvider === "official" && !key.startsWith("pst-"))) {
+      setError(apiProvider === "official" ? "请先填写正确的 pst- 开头 Key。" : "请先填写第三方网站的 Key。");
+      return;
+    }
+    if (apiProvider === "custom" && !/^https?:\/\//i.test(activeBaseUrl.trim())) {
+      setError("请填写以 http:// 或 https:// 开头的第三方 API 地址。");
       return;
     }
     if (!basePrompt) {
@@ -715,12 +984,12 @@ export default function Home() {
           (vibe) => vibe.information,
         );
       }
-      const response = await fetch("https://image.novelai.net/ai/generate-image", {
+      const response = await fetch(joinEndpoint(activeBaseUrl, apiProvider === "official" ? "/ai/generate-image" : customGeneratePath), {
         method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        headers: apiHeaders(key),
         body: JSON.stringify({
           input: combinedPrompt,
-          model,
+          model: requestModel,
           action: "generate",
           parameters,
         }),
@@ -730,17 +999,9 @@ export default function Home() {
         throw new Error(friendlyError(response.status, detail.slice(0, 180)));
       }
       setStatus("正在打开图片…");
-      const files = unzipSync(new Uint8Array(await response.arrayBuffer()));
-      const entries = Object.entries(files)
-        .filter(([name]) => name.toLowerCase().endsWith(".png"))
-        .sort(([a], [b]) => a.localeCompare(b));
-      if (!entries.length) throw new Error("NAI 已返回结果，但没有找到 PNG 图片。");
-
+      const blobs = await readGeneratedImages(response);
       results.forEach((result) => URL.revokeObjectURL(result.url));
-      const nextResults = entries.map(([, bytes], index) => {
-        const blob = new Blob([bytes as BlobPart], { type: "image/png" });
-        return { blob, index, url: URL.createObjectURL(blob) };
-      });
+      const nextResults = blobs.map((blob, index) => ({ blob, index, url: URL.createObjectURL(blob) }));
       setResults(nextResults);
       setSeed(String(randomSeed));
 
@@ -774,6 +1035,8 @@ export default function Home() {
         </div>
         <nav className="top-tabs" aria-label="页面切换">
           <button className={activeTab === "create" ? "active" : ""} onClick={() => setActiveTab("create")}>生图</button>
+          <button className={activeTab === "artists" ? "active" : ""} onClick={() => setActiveTab("artists")}>画师</button>
+          <button className={activeTab === "characters" ? "active" : ""} onClick={() => setActiveTab("characters")}>角色</button>
           <button className={activeTab === "gallery" ? "active" : ""} onClick={() => { setActiveTab("gallery"); void loadGallery(); }}>图库{gallery.length ? <b>{gallery.length}</b> : null}</button>
         </nav>
       </header>
@@ -798,6 +1061,63 @@ export default function Home() {
             </div>
           )}
         </section>
+      ) : activeTab === "artists" ? (
+        <section className="library-page">
+          <div className="library-heading">
+            <div><span className="eyebrow">STYLE LIBRARY</span><h2>画师串库</h2><p>保存画师串和例图，生图时一键切换</p></div>
+            <button type="button" onClick={newArtistPreset}>＋ 新建</button>
+          </div>
+          <div className="library-layout">
+            <section className="library-editor">
+              <div className="example-editor">
+                {artistExampleImage ? <img src={artistExampleImage} alt="画师串例图" /> : <div className="example-placeholder"><span>◇</span><strong>添加例图</strong><small>方便辨认画风</small></div>}
+                <div><button type="button" onClick={() => artistExampleInput.current?.click()}>{artistExampleImage ? "更换例图" : "上传例图"}</button>{artistExampleImage && <button type="button" className="quiet-danger" onClick={() => setArtistExampleImage("")}>移除</button>}</div>
+                <input ref={artistExampleInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importArtistExample(event)} />
+              </div>
+              <label><span>预设名称</span><input value={artistPresetName} onChange={(event) => setArtistPresetName(event.target.value)} placeholder="例如：月光厚涂" /></label>
+              <label><span>画师串</span><textarea value={artistString} onChange={(event) => setArtistString(event.target.value)} rows={5} placeholder="artist:name, year 2024, amazing quality" spellCheck={false} /></label>
+              <div className="editor-actions"><button type="button" className="primary-action" disabled={!artistPresetName.trim() || !artistString.trim()} onClick={saveArtistPreset}>{selectedArtistPresetId ? "更新画师串" : "保存画师串"}</button>{selectedArtistPresetId && <button type="button" className="danger-action" onClick={deleteArtistPreset}>删除</button>}</div>
+              <p className="helper">资料只保存在当前设备。例图会压缩后保存，不会上传到服务器。</p>
+            </section>
+            <div className="library-collection">
+              {artistPresets.length === 0 ? <div className="library-empty"><strong>还没有画师串</strong><p>先在上方保存一个，之后就能直接切换。</p></div> : <div className="library-grid">
+                {artistPresets.map((preset) => <article className={`library-card ${preset.id === selectedArtistPresetId ? "selected" : ""}`} key={preset.id}>
+                  <button type="button" className="card-main" onClick={() => selectArtistPreset(preset.id)}>{preset.exampleImage ? <img src={preset.exampleImage} alt={`${preset.name} 例图`} loading="lazy" /> : <div className="card-placeholder">ART</div>}<span><strong>{preset.name}</strong><small>{preset.value}</small></span></button>
+                  <div className="card-actions"><button type="button" onClick={() => { selectArtistPreset(preset.id); setActiveTab("create"); }}>用于生图</button><button type="button" onClick={() => selectArtistPreset(preset.id)}>编辑</button></div>
+                </article>)}
+              </div>}
+            </div>
+          </div>
+        </section>
+      ) : activeTab === "characters" ? (
+        <section className="library-page">
+          <div className="library-heading">
+            <div><span className="eyebrow">CHARACTER LIBRARY</span><h2>角色库</h2><p>保存角色提示词，需要时复制或直接用于生图</p></div>
+            <button type="button" onClick={startNewCharacter}>＋ 新建</button>
+          </div>
+          <div className="library-layout">
+            <section className="library-editor">
+              <div className="example-editor">
+                {characterExampleImage ? <img src={characterExampleImage} alt="角色例图" /> : <div className="example-placeholder"><span>♙</span><strong>添加角色图</strong><small>可选</small></div>}
+                <div><button type="button" onClick={() => characterExampleInput.current?.click()}>{characterExampleImage ? "更换例图" : "上传例图"}</button>{characterExampleImage && <button type="button" className="quiet-danger" onClick={() => setCharacterExampleImage("")}>移除</button>}</div>
+                <input ref={characterExampleInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importCharacterExample(event)} />
+              </div>
+              <label><span>角色名称</span><input value={characterName} onChange={(event) => setCharacterName(event.target.value)} placeholder="例如：蓝发骑士" /></label>
+              <label><span>角色提示词</span><textarea value={characterPrompt} onChange={(event) => setCharacterPrompt(event.target.value)} rows={6} placeholder="角色外观、服装和固定特征…" spellCheck={false} /></label>
+              <div className="editor-actions"><button type="button" className="primary-action" disabled={!characterName.trim() || !characterPrompt.trim()} onClick={saveCharacter}>{editingCharacterId ? "更新角色" : "保存角色"}</button>{editingCharacterId && <button type="button" className="danger-action" onClick={() => deleteCharacter(editingCharacterId)}>删除</button>}</div>
+              <p className="helper">保存后可直接复制，也可选为当前生图角色；不会覆盖你输入的场景提示词。</p>
+            </section>
+            <div className="library-collection">
+              <div className="library-search"><span>⌕</span><input value={characterSearch} onChange={(event) => setCharacterSearch(event.target.value)} placeholder="搜索角色名称或提示词" /></div>
+              {filteredCharacters.length === 0 ? <div className="library-empty"><strong>{characters.length ? "没有匹配的角色" : "还没有角色"}</strong><p>{characters.length ? "换个关键词试试。" : "在上方建立你的第一个角色。"}</p></div> : <div className="library-grid">
+                {filteredCharacters.map((character) => <article className={`library-card ${character.id === selectedCharacterId ? "selected" : ""}`} key={character.id}>
+                  <button type="button" className="card-main" onClick={() => editCharacter(character)}>{character.exampleImage ? <img src={character.exampleImage} alt={`${character.name} 例图`} loading="lazy" /> : <div className="card-placeholder character">CHAR</div>}<span><strong>{character.name}</strong><small>{character.prompt}</small></span></button>
+                  <div className="card-actions three"><button type="button" onClick={() => void copyCharacterPrompt(character)}>{copiedCharacterId === character.id ? "已复制" : "复制"}</button><button type="button" onClick={() => { setSelectedCharacterId(character.id); setActiveTab("create"); }}>用于生图</button><button type="button" onClick={() => editCharacter(character)}>编辑</button></div>
+                </article>)}
+              </div>}
+            </div>
+          </div>
+        </section>
       ) : (
         <div className="workspace">
           <section className="result-panel" aria-live="polite">
@@ -821,32 +1141,41 @@ export default function Home() {
             )}
           </section>
 
-          <section className="control-card">
-            <label className="field-label" htmlFor="api-key"><span>NAI Key</span><small>pst- 开头</small></label>
-            <div className="key-field"><input id="api-key" type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="粘贴你的 pst- Key" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button><button type="button" className="clear-key" onClick={() => setApiKey("")} disabled={!apiKey}>清除</button></div>
-            <p className="helper">Key 会长期保存在当前设备的这个浏览器中，并直接发送给 NovelAI。请不要在公共设备上保存。</p>
+          <section className="control-card connection-card">
+            <div className="section-heading compact"><div><h2>连接方式</h2><p>官方 NovelAI 或兼容它请求格式的第三方接口</p></div></div>
+            <div className="provider-switch"><button type="button" className={apiProvider === "official" ? "active" : ""} onClick={() => setApiProvider("official")}><strong>官方 NAI</strong><small>pst- Key</small></button><button type="button" className={apiProvider === "custom" ? "active" : ""} onClick={() => setApiProvider("custom")}><strong>第三方兼容</strong><small>自定义地址与 Key</small></button></div>
+            {apiProvider === "official" ? <>
+              <label className="field-label" htmlFor="api-key"><span>NAI Key</span><small>pst- 开头</small></label>
+              <div className="key-field"><input id="api-key" type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="粘贴你的 pst- Key" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button><button type="button" className="clear-key" onClick={() => setApiKey("")} disabled={!apiKey}>清除</button></div>
+              <p className="helper">Key 长期保存在当前浏览器，只会在生图时直接发送给 NovelAI。</p>
+            </> : <div className="custom-api-fields">
+              <label><span>第三方 API 地址</span><input value={customBaseUrl} onChange={(event) => setCustomBaseUrl(event.target.value)} placeholder="https://example.com" autoCapitalize="none" spellCheck={false} /></label>
+              <label><span>第三方 Key</span><div className="key-field"><input type={showKey ? "text" : "password"} value={customApiKey} onChange={(event) => setCustomApiKey(event.target.value)} placeholder="填写第三方网站提供的 Key" autoCapitalize="none" spellCheck={false} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button><button type="button" className="clear-key" onClick={() => setCustomApiKey("")} disabled={!customApiKey}>清除</button></div></label>
+              <div className="two-cols"><label><span>生图路径</span><input value={customGeneratePath} onChange={(event) => setCustomGeneratePath(event.target.value)} placeholder="/ai/generate-image" /></label><label><span>Vibe 编码路径</span><input value={customEncodePath} onChange={(event) => setCustomEncodePath(event.target.value)} placeholder="/ai/encode-vibe" /></label></div>
+              <div className="two-cols"><label><span>模型名称</span><input value={customModel} onChange={(event) => { setCustomModel(event.target.value); setVibes((current) => current.map((vibe) => vibe.source === "image" ? { ...vibe, encoding: undefined, encodingKey: undefined } : vibe)); }} placeholder="nai-diffusion-4-5-full" /></label><label><span>鉴权方式</span><select value={customAuthMode} onChange={(event) => setCustomAuthMode(event.target.value as CustomAuthMode)}><option value="bearer">Bearer Key</option><option value="x-api-key">x-api-key</option><option value="raw">Authorization 原值</option></select></label></div>
+              <p className="helper">接口需允许浏览器跨域访问，并兼容 NAI 请求。结果支持 ZIP、图片、图片 URL 或 Base64 JSON。</p>
+            </div>}
           </section>
 
           <section className="control-card prompt-card">
             <label className="field-label" htmlFor="prompt"><span>提示词</span><small>支持 NAI 标签与 {'{ }'} 权重</small></label>
             <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：1girl, solo, long black hair, blue highlights…" rows={7} spellCheck={false} />
             <div className="prompt-tools"><span>{prompt.length} 字符</span><button type="button" onClick={() => setPrompt("")} disabled={!prompt}>清空</button></div>
-            <div className="artist-divider" />
-            <div className="artist-heading"><label htmlFor="artist-string"><span>画师串</span><small>自动放在每次提示词最前面</small></label><button type="button" className={`mini-switch ${artistEnabled ? "on" : ""}`} onClick={() => setArtistEnabled((value) => !value)} aria-pressed={artistEnabled}>{artistEnabled ? "已启用" : "未启用"}</button></div>
-            <div className="artist-preset-picker">
-              <select value={selectedArtistPresetId} onChange={(event) => selectArtistPreset(event.target.value)} aria-label="选择画师串预设">
-                <option value="">选择已保存的画师串</option>
-                {artistPresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
-              </select>
-              <button type="button" onClick={newArtistPreset}>新建</button>
-              <button type="button" className="delete-preset" disabled={!selectedArtistPresetId} onClick={deleteArtistPreset}>删除</button>
+            <div className="prompt-library-links">
+              <div className="active-preset-row">
+                {currentArtistPreset?.exampleImage ? <img src={currentArtistPreset.exampleImage} alt="当前画师串例图" /> : <div className="mini-placeholder">ART</div>}
+                <span><strong>当前画师串</strong><small>{currentArtistPreset?.name ?? (artistString.trim() ? "未保存的画师串" : "未选择")}</small></span>
+                <button type="button" className={`mini-switch ${artistEnabled ? "on" : ""}`} onClick={() => setArtistEnabled((value) => !value)}>{artistEnabled ? "启用" : "关闭"}</button>
+                <button type="button" className="open-library" onClick={() => setActiveTab("artists")}>画师库</button>
+              </div>
+              <div className="active-preset-row">
+                {selectedCharacter?.exampleImage ? <img src={selectedCharacter.exampleImage} alt="当前角色例图" /> : <div className="mini-placeholder character">CHAR</div>}
+                <span><strong>当前角色</strong><small>{selectedCharacter?.name ?? "未选择"}</small></span>
+                {selectedCharacter && <button type="button" className="remove-active" onClick={() => setSelectedCharacterId("")}>移除</button>}
+                <button type="button" className="open-library" onClick={() => setActiveTab("characters")}>角色库</button>
+              </div>
             </div>
-            <textarea id="artist-string" className="artist-input" value={artistString} onChange={(event) => setArtistString(event.target.value)} placeholder="例如：artist:name, year 2024, amazing quality" rows={3} spellCheck={false} />
-            <div className="artist-preset-save">
-              <input value={artistPresetName} onChange={(event) => setArtistPresetName(event.target.value)} placeholder="预设名称，例如：厚涂画师串" />
-              <button type="button" disabled={!artistPresetName.trim() || !artistString.trim()} onClick={saveArtistPreset}>{selectedArtistPresetId ? "更新预设" : "保存预设"}</button>
-            </div>
-            <p className="helper">画师串和预设都保存在当前设备，选择名称即可立即切换。</p>
+            {artistEnabled && artistString.trim() && <details className="active-prompt-detail"><summary>查看当前画师串</summary><p>{artistString}</p></details>}
           </section>
 
           <section className="control-card vibe-card">
@@ -902,6 +1231,13 @@ export default function Home() {
       )}
 
       {activeTab === "create" && <div className="generate-dock"><button className="generate-button" type="button" disabled={busy} onClick={generate}>{busy ? <><span className="button-spinner" />{status || "处理中…"}</> : <><span>✦</span>生成 {generationCount} 张图片</>}</button><small>图片生成后会自动保存到图库</small></div>}
+
+      <nav className="bottom-nav" aria-label="手机页面切换">
+        <button type="button" className={activeTab === "create" ? "active" : ""} onClick={() => setActiveTab("create")}><span>✦</span><small>生图</small></button>
+        <button type="button" className={activeTab === "artists" ? "active" : ""} onClick={() => setActiveTab("artists")}><span>◇</span><small>画师</small></button>
+        <button type="button" className={activeTab === "characters" ? "active" : ""} onClick={() => setActiveTab("characters")}><span>♙</span><small>角色</small></button>
+        <button type="button" className={activeTab === "gallery" ? "active" : ""} onClick={() => { setActiveTab("gallery"); void loadGallery(); }}><span>▧</span><small>图库</small></button>
+      </nav>
 
       {appearanceOpen && <div className="appearance-modal" role="dialog" aria-modal="true" aria-label="顶部设计" onClick={() => setAppearanceOpen(false)}><section className="appearance-card" onClick={(event) => event.stopPropagation()}><div className="appearance-heading"><div><h2>顶部设计</h2><p>点击左上角图标可以随时回来修改</p></div><button type="button" onClick={() => setAppearanceOpen(false)} aria-label="关闭">×</button></div><div className="appearance-preview"><div className="brand-mark" style={{ background: brandColor }}>{brandLogo ? <img src={brandLogo} alt="预览图标" /> : brandIconText.trim().slice(0, 2) || "N"}</div><div><strong>{brandName.trim() || "JunNAI"}</strong><small>{brandSubtitle.trim() || "简单、直接的手机生图页"}</small></div></div><div className="appearance-fields"><label><span>网站名称</span><input value={brandName} maxLength={20} onChange={(event) => setBrandName(event.target.value)} placeholder="JunNAI" /></label><label><span>副标题</span><input value={brandSubtitle} maxLength={40} onChange={(event) => setBrandSubtitle(event.target.value)} placeholder="简单、直接的手机生图页" /></label><div className="appearance-row"><label><span>图标文字</span><input value={brandIconText} maxLength={2} onChange={(event) => setBrandIconText(event.target.value)} placeholder="N" disabled={Boolean(brandLogo)} /></label><label><span>图标颜色</span><input type="color" value={brandColor} onChange={(event) => setBrandColor(event.target.value)} /></label></div></div><div className="appearance-actions"><button type="button" onClick={() => brandLogoInput.current?.click()}>{brandLogo ? "更换图标图片" : "上传图标图片"}</button>{brandLogo && <button type="button" onClick={() => setBrandLogo("")}>移除图片</button>}<button type="button" className="reset-design" onClick={resetBrandDesign}>恢复默认</button></div><input ref={brandLogoInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importBrandLogo(event)} />{appearanceError && <p className="appearance-error">{appearanceError}</p>}<button type="button" className="appearance-done" onClick={() => setAppearanceOpen(false)}>完成</button></section></div>}
 
