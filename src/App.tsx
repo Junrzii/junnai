@@ -32,12 +32,13 @@ type CharacterPreset = {
   exampleImage?: string;
 };
 
-type ActiveTab = "create" | "artists" | "characters" | "gallery";
+type ActiveTab = "create" | "artists" | "vibes" | "characters" | "gallery";
 type ApiProvider = "official" | "custom";
 type CustomAuthMode = "bearer" | "x-api-key" | "raw";
 
 type VibeItem = {
   id: string;
+  libraryId?: string;
   source: "image" | "json";
   name: string;
   file?: File;
@@ -47,6 +48,21 @@ type VibeItem = {
   encoding?: string;
   encodingKey?: string;
 };
+
+type SavedVibeRecord = {
+  id: string;
+  name: string;
+  source: "image" | "json";
+  strength: number;
+  information: number;
+  encoding?: string;
+  blob?: Blob;
+  fileName?: string;
+  mimeType?: string;
+  createdAt: string;
+};
+
+type SavedVibeItem = SavedVibeRecord & { preview?: string };
 
 type ResultItem = { url: string; blob: Blob; index: number };
 
@@ -155,6 +171,56 @@ function cleanEncoding(value: unknown) {
 function parseVibeJson(data: unknown, fileName: string) {
   if (!data || typeof data !== "object") throw new Error(`${fileName} 不是有效的 Vibe JSON。`);
   const root = data as Record<string, unknown>;
+  const transferEncodings = root.encodings;
+  if (
+    root.identifier === "novelai-vibe-transfer" &&
+    transferEncodings &&
+    typeof transferEncodings === "object" &&
+    !Array.isArray(transferEncodings)
+  ) {
+    const importInfo = root.importInfo && typeof root.importInfo === "object"
+      ? root.importInfo as Record<string, unknown>
+      : {};
+    const baseName = typeof root.name === "string" && root.name.trim()
+      ? root.name.trim()
+      : fileName.replace(/\.naiv4vibe\.json$|\.json$/i, "");
+    const found: Array<{
+      encoding: string;
+      name: string;
+      strength: number;
+      information: number;
+    }> = [];
+
+    function visitTransferNode(value: unknown, path: string[]) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const node = value as Record<string, unknown>;
+      const encoding = cleanEncoding(node.encoding);
+      if (encoding) {
+        const params = node.params && typeof node.params === "object"
+          ? node.params as Record<string, unknown>
+          : {};
+        found.push({
+          encoding,
+          name: baseName,
+          strength: clampNumber(importInfo.strength ?? node.strength, 0.6, 0, 1),
+          information: clampNumber(
+            params.information_extracted ?? importInfo.information_extracted ?? node.information,
+            1,
+            0.1,
+            1,
+          ),
+        });
+        return;
+      }
+      Object.entries(node).forEach(([key, child]) => visitTransferNode(child, [...path, key]));
+    }
+
+    visitTransferNode(transferEncodings, []);
+    return found.map((item, index) => ({
+      ...item,
+      name: found.length > 1 ? `${item.name} ${index + 1}` : item.name,
+    }));
+  }
   const parameterSource =
     root.parameters && typeof root.parameters === "object"
       ? (root.parameters as Record<string, unknown>)
@@ -376,13 +442,17 @@ function formatTime(value: string) {
 
 const galleryDbName = "nai-vibe-gallery";
 const galleryStoreName = "images";
+const vibeLibraryStoreName = "vibe-library";
 
 function openGalleryDb() {
   return new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(galleryDbName, 1);
+    const request = indexedDB.open(galleryDbName, 2);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(galleryStoreName)) {
         request.result.createObjectStore(galleryStoreName, { keyPath: "id" });
+      }
+      if (!request.result.objectStoreNames.contains(vibeLibraryStoreName)) {
+        request.result.createObjectStore(vibeLibraryStoreName, { keyPath: "id" });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -412,6 +482,35 @@ async function removeGalleryRecord(id: string) {
   const db = await openGalleryDb();
   return new Promise<void>((resolve, reject) => {
     const request = db.transaction(galleryStoreName, "readwrite").objectStore(galleryStoreName).delete(id);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function readSavedVibeRecords() {
+  const db = await openGalleryDb();
+  return new Promise<SavedVibeRecord[]>((resolve, reject) => {
+    const request = db.transaction(vibeLibraryStoreName, "readonly").objectStore(vibeLibraryStoreName).getAll();
+    request.onsuccess = () => resolve(
+      (request.result as SavedVibeRecord[]).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+    );
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function writeSavedVibeRecord(record: SavedVibeRecord) {
+  const db = await openGalleryDb();
+  return new Promise<void>((resolve, reject) => {
+    const request = db.transaction(vibeLibraryStoreName, "readwrite").objectStore(vibeLibraryStoreName).put(record);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function removeSavedVibeRecord(id: string) {
+  const db = await openGalleryDb();
+  return new Promise<void>((resolve, reject) => {
+    const request = db.transaction(vibeLibraryStoreName, "readwrite").objectStore(vibeLibraryStoreName).delete(id);
     request.onsuccess = () => resolve();
     request.onerror = () => reject(request.error);
   });
@@ -462,6 +561,10 @@ export default function Home() {
   const [sampler, setSampler] = useState("k_euler_ancestral");
   const [seed, setSeed] = useState("");
   const [vibes, setVibes] = useState<VibeItem[]>([]);
+  const [savedVibes, setSavedVibes] = useState<SavedVibeItem[]>([]);
+  const [vibeLibraryLoading, setVibeLibraryLoading] = useState(false);
+  const [vibeLibraryError, setVibeLibraryError] = useState("");
+  const [vibeLibrarySearch, setVibeLibrarySearch] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
   const [busy, setBusy] = useState(false);
@@ -473,6 +576,7 @@ export default function Home() {
   const [galleryError, setGalleryError] = useState("");
   const [selectedImage, setSelectedImage] = useState<GalleryItem | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const vibeLibraryInput = useRef<HTMLInputElement>(null);
   const brandLogoInput = useRef<HTMLInputElement>(null);
   const artistExampleInput = useRef<HTMLInputElement>(null);
   const characterExampleInput = useRef<HTMLInputElement>(null);
@@ -585,7 +689,10 @@ export default function Home() {
   ]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => void loadGallery(), 0);
+    const timer = window.setTimeout(() => {
+      void loadGallery();
+      void loadVibeLibrary();
+    }, 0);
     return () => window.clearTimeout(timer);
   }, []);
 
@@ -605,6 +712,9 @@ export default function Home() {
   const currentArtistPreset = artistPresets.find((item) => item.id === selectedArtistPresetId) ?? null;
   const filteredCharacters = characters.filter((item) =>
     `${item.name} ${item.prompt}`.toLowerCase().includes(characterSearch.trim().toLowerCase()),
+  );
+  const filteredSavedVibes = savedVibes.filter((item) =>
+    item.name.toLowerCase().includes(vibeLibrarySearch.trim().toLowerCase()),
   );
   const isSmallPreset = sizeKey.startsWith("small");
   const opusUnlimitedReady = isSmallPreset && generationCount === 1 && steps <= 28;
@@ -662,6 +772,155 @@ export default function Home() {
       setGalleryError(caught instanceof Error ? caught.message : "图库暂时加载失败");
     } finally {
       setGalleryLoading(false);
+    }
+  }
+
+  async function loadVibeLibrary() {
+    setVibeLibraryLoading(true);
+    setVibeLibraryError("");
+    try {
+      const records = await readSavedVibeRecords();
+      setSavedVibes((current) => {
+        current.forEach((item) => {
+          if (item.preview) URL.revokeObjectURL(item.preview);
+        });
+        return records.map((record) => ({
+          ...record,
+          preview: record.blob ? URL.createObjectURL(record.blob) : undefined,
+        }));
+      });
+    } catch (caught) {
+      setVibeLibraryError(caught instanceof Error ? caught.message : "Vibe 库暂时加载失败。");
+    } finally {
+      setVibeLibraryLoading(false);
+    }
+  }
+
+  async function saveVibeToLibrary(vibe: VibeItem) {
+    const id = vibe.libraryId ?? crypto.randomUUID();
+    await writeSavedVibeRecord({
+      id,
+      name: vibe.name.replace(/\.(png|jpe?g|webp|naiv4vibe\.json|json)$/i, "") || "未命名 Vibe",
+      source: vibe.source,
+      strength: vibe.strength,
+      information: vibe.information,
+      encoding: vibe.encoding,
+      blob: vibe.file,
+      fileName: vibe.file?.name,
+      mimeType: vibe.file?.type,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  async function saveCurrentVibesToLibrary() {
+    if (!vibes.length) return;
+    try {
+      const ids = new Map<string, string>();
+      for (const vibe of vibes) ids.set(vibe.id, await saveVibeToLibrary(vibe));
+      setVibes((current) => current.map((vibe) => ({ ...vibe, libraryId: ids.get(vibe.id) ?? vibe.libraryId })));
+      await loadVibeLibrary();
+      setNotice(`已把 ${vibes.length} 个 Vibe 保存到当前设备。`);
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Vibe 保存失败。");
+    }
+  }
+
+  async function importVibesToLibrary(event: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!picked.length) return;
+    let savedCount = 0;
+    let importError = "";
+    for (const file of picked) {
+      if (file.type === "application/json" || file.name.toLowerCase().endsWith(".json")) {
+        try {
+          const parsed = parseVibeJson(JSON.parse(await file.text()), file.name);
+          for (const item of parsed) {
+            await writeSavedVibeRecord({
+              id: crypto.randomUUID(),
+              name: item.name,
+              source: "json",
+              strength: item.strength,
+              information: item.information,
+              encoding: item.encoding,
+              createdAt: new Date().toISOString(),
+            });
+            savedCount += 1;
+          }
+          if (!parsed.length) importError = `${file.name} 中没有找到可识别的 Vibe encoding。`;
+        } catch (caught) {
+          importError = caught instanceof Error ? caught.message : `${file.name} 读取失败。`;
+        }
+        continue;
+      }
+      if (!file.type.startsWith("image/")) {
+        importError = `${file.name} 不是支持的图片或 JSON 文件。`;
+        continue;
+      }
+      await writeSavedVibeRecord({
+        id: crypto.randomUUID(),
+        name: file.name.replace(/\.(png|jpe?g|webp)$/i, ""),
+        source: "image",
+        strength: 0.6,
+        information: 1,
+        blob: file,
+        fileName: file.name,
+        mimeType: file.type,
+        createdAt: new Date().toISOString(),
+      });
+      savedCount += 1;
+    }
+    await loadVibeLibrary();
+    setError(importError);
+    if (savedCount) setNotice(`已导入并保存 ${savedCount} 个 Vibe。`);
+  }
+
+  function useSavedVibe(item: SavedVibeItem) {
+    if (vibes.length >= 4) {
+      setError("当前生图区最多使用 4 个 Vibe，请先移除一个。");
+      return;
+    }
+    if (vibes.some((vibe) => vibe.libraryId === item.id)) {
+      setError("这个 Vibe 已经在当前生图区里了。");
+      return;
+    }
+    const file = item.blob
+      ? new File([item.blob], item.fileName ?? `${item.name}.png`, { type: item.mimeType ?? item.blob.type })
+      : undefined;
+    setVibes((current) => [...current, {
+      id: crypto.randomUUID(),
+      libraryId: item.id,
+      source: item.source,
+      name: item.name,
+      file,
+      preview: item.blob ? URL.createObjectURL(item.blob) : undefined,
+      strength: item.strength,
+      information: item.information,
+      encoding: item.encoding,
+    }].slice(0, 4));
+    setActiveTab("create");
+    setError("");
+    setNotice(`${item.name} 已加入当前生图。`);
+  }
+
+  async function updateSavedVibe(id: string, update: Partial<SavedVibeRecord>) {
+    const target = savedVibes.find((item) => item.id === id);
+    if (!target) return;
+    const { preview: _preview, ...record } = target;
+    await writeSavedVibeRecord({ ...record, ...update });
+    setSavedVibes((current) => current.map((item) => item.id === id ? { ...item, ...update } : item));
+  }
+
+  async function deleteSavedVibe(item: SavedVibeItem) {
+    try {
+      await removeSavedVibeRecord(item.id);
+      if (item.preview) URL.revokeObjectURL(item.preview);
+      setSavedVibes((current) => current.filter((saved) => saved.id !== item.id));
+      setVibes((current) => current.map((vibe) => vibe.libraryId === item.id ? { ...vibe, libraryId: undefined } : vibe));
+    } catch {
+      setVibeLibraryError("删除失败，请稍后重试。");
     }
   }
 
@@ -1036,6 +1295,7 @@ export default function Home() {
         <nav className="top-tabs" aria-label="页面切换">
           <button className={activeTab === "create" ? "active" : ""} onClick={() => setActiveTab("create")}>生图</button>
           <button className={activeTab === "artists" ? "active" : ""} onClick={() => setActiveTab("artists")}>画师</button>
+          <button className={activeTab === "vibes" ? "active" : ""} onClick={() => { setActiveTab("vibes"); void loadVibeLibrary(); }}>Vibe</button>
           <button className={activeTab === "characters" ? "active" : ""} onClick={() => setActiveTab("characters")}>角色</button>
           <button className={activeTab === "gallery" ? "active" : ""} onClick={() => { setActiveTab("gallery"); void loadGallery(); }}>图库{gallery.length ? <b>{gallery.length}</b> : null}</button>
         </nav>
@@ -1088,6 +1348,28 @@ export default function Home() {
               </div>}
             </div>
           </div>
+        </section>
+      ) : activeTab === "vibes" ? (
+        <section className="library-page vibe-library-page">
+          <div className="library-heading">
+            <div><span className="eyebrow">VIBE LIBRARY</span><h2>Vibe 库</h2><p>图片与 JSON Vibe 保存在当前设备，随时一键加入生图</p></div>
+            <button type="button" onClick={() => vibeLibraryInput.current?.click()}>＋ 导入 Vibe</button>
+            <input ref={vibeLibraryInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,application/json,.json,.naiv4vibe.json" multiple onChange={(event) => void importVibesToLibrary(event)} />
+          </div>
+          <div className="library-search"><span>⌕</span><input value={vibeLibrarySearch} onChange={(event) => setVibeLibrarySearch(event.target.value)} placeholder="搜索 Vibe 名称" /></div>
+          {vibeLibraryError && <div className="message error-message"><strong>Vibe 库没有加载成功</strong><span>{vibeLibraryError}</span></div>}
+          {vibeLibraryLoading ? <div className="library-empty"><strong>正在载入 Vibe 库…</strong></div> : filteredSavedVibes.length === 0 ? <div className="library-empty"><strong>{savedVibes.length ? "没有匹配的 Vibe" : "Vibe 库还是空的"}</strong><p>{savedVibes.length ? "换个名称搜索。" : "导入图片或 JSON；支持 NovelAI 导出的 .naiv4vibe.json。"}</p></div> : <div className="vibe-library-grid">
+            {filteredSavedVibes.map((item) => <article className="saved-vibe-card" key={item.id}>
+              <div className="saved-vibe-preview">{item.preview ? <img src={item.preview} alt={`${item.name} Vibe`} loading="lazy" /> : <div><strong>JSON</strong><small>已保存编码</small></div>}<span>{item.source === "json" ? "JSON" : "图片"}</span></div>
+              <div className="saved-vibe-body">
+                <div className="saved-vibe-title"><strong>{item.name}</strong><small>{formatTime(item.createdAt)}</small></div>
+                <label><span>影响强度 <b>{item.strength.toFixed(2)}</b></span><input type="range" min="0" max="1" step="0.05" value={item.strength} onChange={(event) => void updateSavedVibe(item.id, { strength: Number(event.target.value) })} /></label>
+                <label><span>信息提取 <b>{item.information.toFixed(2)}</b></span><input type="range" min="0.1" max="1" step="0.05" value={item.information} onChange={(event) => void updateSavedVibe(item.id, { information: Number(event.target.value) })} /></label>
+                <div className="saved-vibe-actions"><button type="button" onClick={() => useSavedVibe(item)}>用于生图</button><button type="button" className="delete-saved-vibe" onClick={() => void deleteSavedVibe(item)}>删除</button></div>
+              </div>
+            </article>)}
+          </div>}
+          <p className="local-storage-note">Vibe 编码和原始图片保存在当前浏览器的 IndexedDB，不会上传到 GitHub。清除网站数据时会一并删除。</p>
         </section>
       ) : activeTab === "characters" ? (
         <section className="library-page">
@@ -1179,7 +1461,7 @@ export default function Home() {
           </section>
 
           <section className="control-card vibe-card">
-            <div className="section-heading"><div><h2>Vibe 参考</h2><p>支持图片和带 encoding 的 JSON，最多 4 个</p></div><span className="optional">可选</span></div>
+            <div className="section-heading"><div><h2>Vibe 参考</h2><p>支持图片、普通 encoding JSON 和 NovelAI Vibe JSON，最多 4 个</p></div><div className="section-heading-actions"><button type="button" onClick={() => { setActiveTab("vibes"); void loadVibeLibrary(); }}>Vibe 库</button><span className="optional">可选</span></div></div>
             {vibes.length === 0 ? (
               <button className="vibe-upload" type="button" onClick={() => fileInput.current?.click()}><span className="upload-icon">＋</span><span><strong>导入 Vibe</strong><small>JPG、PNG、WebP 或 JSON</small></span></button>
             ) : (
@@ -1197,8 +1479,9 @@ export default function Home() {
                 {vibes.length < 4 && <button className="add-another" type="button" onClick={() => fileInput.current?.click()}>＋ 再导入一个</button>}
               </div>
             )}
-            <input ref={fileInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,application/json,.json" multiple onChange={(event) => void addVibes(event)} />
+            <input ref={fileInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,application/json,.json,.naiv4vibe.json" multiple onChange={(event) => void addVibes(event)} />
             {vibes.length > 0 && <div className={`vibe-note ${strengthTotal > 1 ? "warning" : ""}`}><span>图片 Vibe 首次编码通常消耗 2 Anlas；JSON 编码可直接使用</span><strong>总强度 {strengthTotal.toFixed(2)}</strong>{strengthTotal > 1 && <small>建议把总强度调到 1.00 以内</small>}</div>}
+            {vibes.length > 0 && <div className="vibe-library-actions"><button type="button" onClick={() => void saveCurrentVibesToLibrary()}>保存当前到 Vibe 库</button><button type="button" onClick={() => { setActiveTab("vibes"); void loadVibeLibrary(); }}>管理 Vibe 库</button></div>}
           </section>
 
           <section className="control-card">
@@ -1235,6 +1518,7 @@ export default function Home() {
       <nav className="bottom-nav" aria-label="手机页面切换">
         <button type="button" className={activeTab === "create" ? "active" : ""} onClick={() => setActiveTab("create")}><span>✦</span><small>生图</small></button>
         <button type="button" className={activeTab === "artists" ? "active" : ""} onClick={() => setActiveTab("artists")}><span>◇</span><small>画师</small></button>
+        <button type="button" className={activeTab === "vibes" ? "active" : ""} onClick={() => { setActiveTab("vibes"); void loadVibeLibrary(); }}><span>◈</span><small>Vibe</small></button>
         <button type="button" className={activeTab === "characters" ? "active" : ""} onClick={() => setActiveTab("characters")}><span>♙</span><small>角色</small></button>
         <button type="button" className={activeTab === "gallery" ? "active" : ""} onClick={() => { setActiveTab("gallery"); void loadGallery(); }}><span>▧</span><small>图库</small></button>
       </nav>

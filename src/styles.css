@@ -320,7 +320,31 @@ input[type="range"] { width: 100%; accent-color: var(--lavender); }
 .library-empty strong { color: var(--ink); font-size: 14px; }
 .library-empty p { margin: 6px 0 0; font-size: 10px; }
 
-.bottom-nav { position: fixed; z-index: 45; right: 0; bottom: 0; left: 0; display: none; grid-template-columns: repeat(4, 1fr); padding: 6px 10px calc(5px + env(safe-area-inset-bottom)); background: rgba(252, 250, 253, .93); border-top: 1px solid rgba(222, 215, 228, .95); backdrop-filter: blur(22px) saturate(1.4); }
+.section-heading-actions { display: flex; align-items: center; gap: 7px; }
+.section-heading-actions > button { min-height: 31px; padding: 0 10px; color: #654bbb; background: #eee9fa; border: 0; border-radius: 9px; font-size: 9px; font-weight: 800; white-space: nowrap; }
+.vibe-library-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.vibe-library-actions button { min-height: 39px; color: #654bbb; background: #eee9fa; border: 0; border-radius: 11px; font-size: 10px; font-weight: 800; }
+.vibe-library-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.saved-vibe-card { min-width: 0; overflow: hidden; background: white; border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 8px 24px rgba(63, 46, 76, .05); }
+.saved-vibe-preview { position: relative; width: 100%; aspect-ratio: 4 / 3; overflow: hidden; background: #eee9fa; }
+.saved-vibe-preview > img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.saved-vibe-preview > div { display: grid; place-items: center; align-content: center; height: 100%; gap: 3px; color: #7054cc; background: linear-gradient(135deg, #f0eafb, #e7dff8); }
+.saved-vibe-preview > div strong { font-size: 15px; letter-spacing: 1px; }
+.saved-vibe-preview > div small { color: #81758c; font-size: 8px; }
+.saved-vibe-preview > span { position: absolute; top: 7px; right: 7px; padding: 4px 7px; color: white; background: rgba(45, 34, 57, .62); border-radius: 7px; font-size: 7px; font-weight: 800; backdrop-filter: blur(8px); }
+.saved-vibe-body { display: grid; gap: 9px; padding: 10px; }
+.saved-vibe-title { display: grid; gap: 3px; min-width: 0; }
+.saved-vibe-title strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.saved-vibe-title small { color: var(--muted); font-size: 8px; }
+.saved-vibe-body > label { display: grid; gap: 5px; color: #61576a; font-size: 8px; font-weight: 700; }
+.saved-vibe-body > label > span { display: flex; justify-content: space-between; gap: 8px; }
+.saved-vibe-body input[type="range"] { width: 100%; accent-color: #7356d4; }
+.saved-vibe-actions { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+.saved-vibe-actions button { min-height: 34px; padding: 0 10px; color: white; background: #7052d2; border: 0; border-radius: 10px; font-size: 9px; font-weight: 800; }
+.saved-vibe-actions .delete-saved-vibe { color: #944b5f; background: #f8e9ed; }
+.local-storage-note { margin: 13px 0 0; padding: 10px 12px; color: #746a7c; background: rgba(255,255,255,.62); border: 1px solid var(--line); border-radius: 12px; font-size: 9px; line-height: 1.55; }
+
+.bottom-nav { position: fixed; z-index: 45; right: 0; bottom: 0; left: 0; display: none; grid-template-columns: repeat(5, 1fr); padding: 6px 10px calc(5px + env(safe-area-inset-bottom)); background: rgba(252, 250, 253, .93); border-top: 1px solid rgba(222, 215, 228, .95); backdrop-filter: blur(22px) saturate(1.4); }
 .bottom-nav button { display: grid; place-items: center; gap: 2px; min-height: 48px; color: #8a818f; background: transparent; border: 0; border-radius: 12px; }
 .bottom-nav button span { font-size: 17px; }
 .bottom-nav button small { font-size: 9px; font-weight: 750; }
@@ -366,6 +390,7 @@ input[type="range"] { width: 100%; accent-color: var(--lavender); }
   .library-layout { grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); align-items: start; }
   .library-editor { position: sticky; top: 86px; }
   .library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .vibe-library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
   .app-shell.gallery-mode { padding-bottom: 38px; }
 }
 
