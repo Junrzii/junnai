@@ -35,6 +35,22 @@ type CharacterPreset = {
 type ActiveTab = "create" | "artists" | "vibes" | "characters" | "gallery";
 type ApiProvider = "official" | "custom";
 type CustomAuthMode = "bearer" | "x-api-key" | "raw";
+type VisualTheme = "lavender" | "mono" | "ios26" | "mint" | "rose" | "sky";
+
+const visualThemes: Array<{
+  id: VisualTheme;
+  name: string;
+  description: string;
+  accent: string;
+  swatches: [string, string, string];
+}> = [
+  { id: "lavender", name: "柔紫", description: "原版柔和紫色", accent: "#6f50dd", swatches: ["#6f50dd", "#eee9fa", "#ffffff"] },
+  { id: "mono", name: "黑白简约", description: "干净利落的纯黑白", accent: "#111111", swatches: ["#111111", "#e8e8e8", "#ffffff"] },
+  { id: "ios26", name: "iOS 26", description: "蓝色液态玻璃质感", accent: "#0a84ff", swatches: ["#0a84ff", "#dff2ff", "#ffffff"] },
+  { id: "mint", name: "薄荷", description: "清爽低饱和绿色", accent: "#16876f", swatches: ["#16876f", "#def6ef", "#ffffff"] },
+  { id: "rose", name: "樱粉", description: "柔和粉白配色", accent: "#c55480", swatches: ["#c55480", "#fae5ee", "#ffffff"] },
+  { id: "sky", name: "雾蓝", description: "安静的灰蓝色", accent: "#456da8", swatches: ["#456da8", "#e2ecf8", "#ffffff"] },
+];
 
 type VibeItem = {
   id: string;
@@ -168,9 +184,76 @@ function cleanEncoding(value: unknown) {
   return value.trim().replace(/^data:[^;]+;base64,/, "");
 }
 
-function parseVibeJson(data: unknown, fileName: string) {
+type ParsedVibeJson = {
+  encoding: string;
+  name: string;
+  strength: number;
+  information: number;
+};
+
+function parseVibeJson(data: unknown, fileName: string): ParsedVibeJson[] {
   if (!data || typeof data !== "object") throw new Error(`${fileName} 不是有效的 Vibe JSON。`);
   const root = data as Record<string, unknown>;
+  const fileBaseName = fileName
+    .replace(/\.json$/i, "")
+    .replace(/\.naiv4vibebundle(?:\(\d+\))?$/i, "")
+    .replace(/\.naiv4vibe(?:\(\d+\))?$/i, "");
+
+  if (root.identifier === "novelai-vibe-transfer-bundle" && Array.isArray(root.vibes)) {
+    const bundleVibes = root.vibes;
+    return bundleVibes.flatMap((vibe, index) =>
+      parseVibeJson(vibe, `${fileBaseName} ${index + 1}.json`).map((item, itemIndex, parsed) => ({
+        ...item,
+        name: bundleVibes.length === 1 && parsed.length === 1
+          ? fileBaseName
+          : `${fileBaseName} ${index + 1}${parsed.length > 1 ? `-${itemIndex + 1}` : ""}`,
+      })),
+    );
+  }
+
+  if (root.vibeData && typeof root.vibeData === "object" && !Array.isArray(root.vibeData)) {
+    const presets = root.vibePresets && typeof root.vibePresets === "object" && !Array.isArray(root.vibePresets)
+      ? root.vibePresets as Record<string, unknown>
+      : {};
+    const groups = root.groups && typeof root.groups === "object" && !Array.isArray(root.groups)
+      ? root.groups as Record<string, unknown>
+      : {};
+    const presetByVibeId = new Map<string, { name: string; strength?: unknown; information?: unknown }>();
+    Object.entries(presets).forEach(([name, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const preset = value as Record<string, unknown>;
+      if (typeof preset.vibeDataId === "string") {
+        presetByVibeId.set(preset.vibeDataId, {
+          name,
+          strength: preset.strength,
+          information: preset.infoExtract ?? preset.information_extracted,
+        });
+      }
+    });
+    const groupStrengthByVibeId = new Map<string, unknown>();
+    Object.values(groups).forEach((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const groupVibes = (value as Record<string, unknown>).vibes;
+      if (!Array.isArray(groupVibes)) return;
+      groupVibes.forEach((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+        const item = entry as Record<string, unknown>;
+        if (typeof item.vibeDataId === "string") groupStrengthByVibeId.set(item.vibeDataId, item.strength);
+      });
+    });
+
+    return Object.entries(root.vibeData as Record<string, unknown>).flatMap(([vibeDataId, vibe], index) => {
+      const preset = presetByVibeId.get(vibeDataId);
+      const displayName = preset?.name || `${fileBaseName} ${index + 1}`;
+      return parseVibeJson(vibe, `${displayName}.json`).map((item, itemIndex, parsed) => ({
+        ...item,
+        name: parsed.length > 1 ? `${displayName} ${itemIndex + 1}` : displayName,
+        strength: clampNumber(preset?.strength ?? groupStrengthByVibeId.get(vibeDataId), item.strength, 0, 1),
+        information: clampNumber(preset?.information, item.information, 0.1, 1),
+      }));
+    });
+  }
+
   const transferEncodings = root.encodings;
   if (
     root.identifier === "novelai-vibe-transfer" &&
@@ -191,7 +274,7 @@ function parseVibeJson(data: unknown, fileName: string) {
       information: number;
     }> = [];
 
-    function visitTransferNode(value: unknown, path: string[]) {
+    function visitTransferNode(value: unknown) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return;
       const node = value as Record<string, unknown>;
       const encoding = cleanEncoding(node.encoding);
@@ -212,10 +295,10 @@ function parseVibeJson(data: unknown, fileName: string) {
         });
         return;
       }
-      Object.entries(node).forEach(([key, child]) => visitTransferNode(child, [...path, key]));
+      Object.values(node).forEach((child) => visitTransferNode(child));
     }
 
-    visitTransferNode(transferEncodings, []);
+    visitTransferNode(transferEncodings);
     return found.map((item, index) => ({
       ...item,
       name: found.length > 1 ? `${item.name} ${index + 1}` : item.name,
@@ -532,6 +615,7 @@ export default function Home() {
   const [brandIconText, setBrandIconText] = useState("N");
   const [brandColor, setBrandColor] = useState("#6f50dd");
   const [brandLogo, setBrandLogo] = useState("");
+  const [visualTheme, setVisualTheme] = useState<VisualTheme>("lavender");
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [appearanceError, setAppearanceError] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -593,6 +677,8 @@ export default function Home() {
       setBrandIconText(localStorage.getItem("nai-brand-icon-text") ?? "N");
       setBrandColor(localStorage.getItem("nai-brand-color") ?? "#6f50dd");
       setBrandLogo(localStorage.getItem("nai-brand-logo") ?? "");
+      const savedTheme = localStorage.getItem("nai-visual-theme");
+      if (visualThemes.some((theme) => theme.id === savedTheme)) setVisualTheme(savedTheme as VisualTheme);
       setApiProvider(localStorage.getItem("nai-api-provider") === "custom" ? "custom" : "official");
       setCustomApiKey(localStorage.getItem("nai-custom-api-key") ?? "");
       setCustomBaseUrl(localStorage.getItem("nai-custom-base-url") ?? "");
@@ -650,6 +736,7 @@ export default function Home() {
     localStorage.setItem("nai-brand-subtitle", brandSubtitle);
     localStorage.setItem("nai-brand-icon-text", brandIconText);
     localStorage.setItem("nai-brand-color", brandColor);
+    localStorage.setItem("nai-visual-theme", visualTheme);
     if (brandLogo) localStorage.setItem("nai-brand-logo", brandLogo);
     else localStorage.removeItem("nai-brand-logo");
     localStorage.setItem("nai-artist-string", artistString);
@@ -686,7 +773,12 @@ export default function Home() {
     preferencesReady,
     selectedArtistPresetId,
     selectedCharacterId,
+    visualTheme,
   ]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = visualTheme;
+  }, [visualTheme]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -758,6 +850,7 @@ export default function Home() {
     setBrandIconText("N");
     setBrandColor("#6f50dd");
     setBrandLogo("");
+    setVisualTheme("lavender");
     setAppearanceError("");
   }
 
@@ -1358,7 +1451,7 @@ export default function Home() {
           </div>
           <div className="library-search"><span>⌕</span><input value={vibeLibrarySearch} onChange={(event) => setVibeLibrarySearch(event.target.value)} placeholder="搜索 Vibe 名称" /></div>
           {vibeLibraryError && <div className="message error-message"><strong>Vibe 库没有加载成功</strong><span>{vibeLibraryError}</span></div>}
-          {vibeLibraryLoading ? <div className="library-empty"><strong>正在载入 Vibe 库…</strong></div> : filteredSavedVibes.length === 0 ? <div className="library-empty"><strong>{savedVibes.length ? "没有匹配的 Vibe" : "Vibe 库还是空的"}</strong><p>{savedVibes.length ? "换个名称搜索。" : "导入图片或 JSON；支持 NovelAI 导出的 .naiv4vibe.json。"}</p></div> : <div className="vibe-library-grid">
+          {vibeLibraryLoading ? <div className="library-empty"><strong>正在载入 Vibe 库…</strong></div> : filteredSavedVibes.length === 0 ? <div className="library-empty"><strong>{savedVibes.length ? "没有匹配的 Vibe" : "Vibe 库还是空的"}</strong><p>{savedVibes.length ? "换个名称搜索。" : "导入图片或 JSON；支持单个 Vibe、Vibe 合集和分组备份。"}</p></div> : <div className="vibe-library-grid">
             {filteredSavedVibes.map((item) => <article className="saved-vibe-card" key={item.id}>
               <div className="saved-vibe-preview">{item.preview ? <img src={item.preview} alt={`${item.name} Vibe`} loading="lazy" /> : <div><strong>JSON</strong><small>已保存编码</small></div>}<span>{item.source === "json" ? "JSON" : "图片"}</span></div>
               <div className="saved-vibe-body">
@@ -1523,7 +1616,27 @@ export default function Home() {
         <button type="button" className={activeTab === "gallery" ? "active" : ""} onClick={() => { setActiveTab("gallery"); void loadGallery(); }}><span>▧</span><small>图库</small></button>
       </nav>
 
-      {appearanceOpen && <div className="appearance-modal" role="dialog" aria-modal="true" aria-label="顶部设计" onClick={() => setAppearanceOpen(false)}><section className="appearance-card" onClick={(event) => event.stopPropagation()}><div className="appearance-heading"><div><h2>顶部设计</h2><p>点击左上角图标可以随时回来修改</p></div><button type="button" onClick={() => setAppearanceOpen(false)} aria-label="关闭">×</button></div><div className="appearance-preview"><div className="brand-mark" style={{ background: brandColor }}>{brandLogo ? <img src={brandLogo} alt="预览图标" /> : brandIconText.trim().slice(0, 2) || "N"}</div><div><strong>{brandName.trim() || "JunNAI"}</strong><small>{brandSubtitle.trim() || "简单、直接的手机生图页"}</small></div></div><div className="appearance-fields"><label><span>网站名称</span><input value={brandName} maxLength={20} onChange={(event) => setBrandName(event.target.value)} placeholder="JunNAI" /></label><label><span>副标题</span><input value={brandSubtitle} maxLength={40} onChange={(event) => setBrandSubtitle(event.target.value)} placeholder="简单、直接的手机生图页" /></label><div className="appearance-row"><label><span>图标文字</span><input value={brandIconText} maxLength={2} onChange={(event) => setBrandIconText(event.target.value)} placeholder="N" disabled={Boolean(brandLogo)} /></label><label><span>图标颜色</span><input type="color" value={brandColor} onChange={(event) => setBrandColor(event.target.value)} /></label></div></div><div className="appearance-actions"><button type="button" onClick={() => brandLogoInput.current?.click()}>{brandLogo ? "更换图标图片" : "上传图标图片"}</button>{brandLogo && <button type="button" onClick={() => setBrandLogo("")}>移除图片</button>}<button type="button" className="reset-design" onClick={resetBrandDesign}>恢复默认</button></div><input ref={brandLogoInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importBrandLogo(event)} />{appearanceError && <p className="appearance-error">{appearanceError}</p>}<button type="button" className="appearance-done" onClick={() => setAppearanceOpen(false)}>完成</button></section></div>}
+      {appearanceOpen && <div className="appearance-modal" role="dialog" aria-modal="true" aria-label="外观设计" onClick={() => setAppearanceOpen(false)}>
+        <section className="appearance-card" onClick={(event) => event.stopPropagation()}>
+          <div className="appearance-heading"><div><h2>外观设计</h2><p>主题和顶部内容都会自动保存在当前设备</p></div><button type="button" onClick={() => setAppearanceOpen(false)} aria-label="关闭">×</button></div>
+          <div className="theme-section">
+            <div className="theme-section-title"><strong>颜色与样式</strong><small>点击即可切换整站主题</small></div>
+            <div className="theme-picker">
+              {visualThemes.map((theme) => <button key={theme.id} type="button" className={visualTheme === theme.id ? "active" : ""} aria-pressed={visualTheme === theme.id} onClick={() => { setVisualTheme(theme.id); setBrandColor(theme.accent); }}>
+                <span className="theme-swatches">{theme.swatches.map((color) => <i key={color} style={{ background: color }} />)}</span>
+                <span><strong>{theme.name}</strong><small>{theme.description}</small></span>
+                <b>{visualTheme === theme.id ? "✓" : ""}</b>
+              </button>)}
+            </div>
+          </div>
+          <div className="appearance-preview"><div className="brand-mark" style={{ background: brandColor }}>{brandLogo ? <img src={brandLogo} alt="预览图标" /> : brandIconText.trim().slice(0, 2) || "N"}</div><div><strong>{brandName.trim() || "JunNAI"}</strong><small>{brandSubtitle.trim() || "简单、直接的手机生图页"}</small></div></div>
+          <div className="appearance-fields"><label><span>网站名称</span><input value={brandName} maxLength={20} onChange={(event) => setBrandName(event.target.value)} placeholder="JunNAI" /></label><label><span>副标题</span><input value={brandSubtitle} maxLength={40} onChange={(event) => setBrandSubtitle(event.target.value)} placeholder="简单、直接的手机生图页" /></label><div className="appearance-row"><label><span>图标文字</span><input value={brandIconText} maxLength={2} onChange={(event) => setBrandIconText(event.target.value)} placeholder="N" disabled={Boolean(brandLogo)} /></label><label><span>图标颜色</span><input type="color" value={brandColor} onChange={(event) => setBrandColor(event.target.value)} /></label></div></div>
+          <div className="appearance-actions"><button type="button" onClick={() => brandLogoInput.current?.click()}>{brandLogo ? "更换图标图片" : "上传图标图片"}</button>{brandLogo && <button type="button" onClick={() => setBrandLogo("")}>移除图片</button>}<button type="button" className="reset-design" onClick={resetBrandDesign}>恢复默认</button></div>
+          <input ref={brandLogoInput} className="hidden-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void importBrandLogo(event)} />
+          {appearanceError && <p className="appearance-error">{appearanceError}</p>}
+          <button type="button" className="appearance-done" onClick={() => setAppearanceOpen(false)}>完成</button>
+        </section>
+      </div>}
 
       {selectedImage && <div className="gallery-modal" role="dialog" aria-modal="true" aria-label="图库图片详情" onClick={() => setSelectedImage(null)}><div className="gallery-modal-card" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setSelectedImage(null)} aria-label="关闭">×</button><img src={selectedImage.imageUrl} alt="放大的 NAI 生成图" /><div className="gallery-meta"><div className="meta-row"><span>{selectedImage.width} × {selectedImage.height}</span><span>Seed {selectedImage.seed}</span><span>{formatTime(selectedImage.createdAt)}</span></div>{selectedImage.artistString && <div><strong>画师串</strong><p>{selectedImage.artistString}</p></div>}<div><strong>完整提示词</strong><p>{selectedImage.prompt}</p></div><div className="modal-actions"><a href={selectedImage.imageUrl} download={`nai-${selectedImage.seed}.png`}>下载原图</a><button onClick={() => void deleteGalleryImage(selectedImage)}>删除图片</button></div></div></div></div>}
     </main>
